@@ -5,6 +5,7 @@
 
 #include "shaders/lines_renderer_mesh_spv.hpp"
 #include "shaders/lines_renderer_frag_spv.hpp"
+#include "shaders/waveform_renderer_mesh_spv.hpp"
 
 namespace plot {
 
@@ -18,6 +19,17 @@ struct HistogramPC {
     uint32_t  trace_offset;
 };
 static_assert(sizeof(HistogramPC) == 40);
+
+struct WaveformPC {
+    glm::vec2 x_range;
+    glm::vec2 y_range;
+    glm::vec2 viewport_ratio;
+    float     line_width;
+    uint32_t  n_samples;
+    uint32_t  first_segment;
+    uint32_t  n_segments;
+};
+static_assert(sizeof(WaveformPC) == 40);
 
 static VkPipelineColorBlendAttachmentState additive_blend() {
     return VkPipelineColorBlendAttachmentState{
@@ -38,12 +50,18 @@ struct Histogram::Impl {
     uint32_t      height;
 
     vke::Image            image;
-    vke::Buffer           staging_buffer;   // host-visible, persistently mapped
-    vke::Buffer           sample_buffer;    // device-local
-    vke::SubmitHandle     pending;          // in-flight fence + owns the command buffer
-    vke::DescriptorLayout desc_layout;
-    vke::DescriptorSet    desc_set;
+    vke::Buffer           staging_buffer;          // host-visible, persistently mapped
+    vke::Buffer           sample_buffer;           // device-local
+    vke::SubmitHandle     pending;                 // in-flight fence + owns the command buffer
+    vke::DescriptorLayout desc_layout;             // shared: binding 0 = storage buffer
+    vke::DescriptorSet    desc_set;                // bound to sample_buffer
     vke::Pipeline         pipeline;
+
+    // Waveform-specific resources (reuses desc_layout and image)
+    vke::Buffer        waveform_staging;
+    vke::Buffer        waveform_device;
+    vke::DescriptorSet waveform_desc_set;          // bound to waveform_device
+    vke::Pipeline      waveform_pipeline;
 
     explicit Impl(vke::Context& ctx, uint32_t w, uint32_t h)
         : ctx(ctx), width(w), height(h)
@@ -93,6 +111,28 @@ struct Histogram::Impl {
             .blend_attachments        = { &blend, 1 },
             .debug_name               = "histogram_pipeline",
         });
+
+        // Waveform pipeline — same fragment shader, new mesh shader, same layout.
+        waveform_desc_set = desc_layout.allocate_set("waveform_set");
+
+        auto waveform_mesh = ctx.create_shader({
+            .stage      = vke::ShaderStage::Mesh,
+            .spirv_code = spv::waveform_renderer_mesh,
+        });
+        vke::PushConstantRange wf_pc_range{
+            .stages = VK_SHADER_STAGE_MESH_BIT_EXT,
+            .size   = sizeof(WaveformPC),
+        };
+        waveform_pipeline = ctx.create_pipeline(vke::MeshPipelineCreateInfo{
+            .mesh_shader              = &waveform_mesh,
+            .fragment_shader          = &frag_shader,
+            .descriptor_layouts       = layouts,
+            .push_constant_ranges     = { &wf_pc_range, 1 },
+            .color_attachment_formats = { &fmt, 1 },
+            .cull_mode                = VK_CULL_MODE_NONE,
+            .blend_attachments        = { &blend, 1 },
+            .debug_name               = "waveform_pipeline",
+        });
     }
 
     // Block until any in-flight command buffer has completed.
@@ -103,6 +143,46 @@ struct Histogram::Impl {
 
     void update_desc_set() {
         desc_set.write().bind_storage_buffer(0, sample_buffer).commit();
+    }
+
+    void update_waveform_desc_set() {
+        waveform_desc_set.write().bind_storage_buffer(0, waveform_device).commit();
+    }
+
+    void record_waveform_batch(vke::CommandBuffer& cmd, const WaveformPC& pc,
+                               uint32_t groups_x) {
+        cmd.image_barrier({
+            .image           = image,
+            .new_layout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .src_stage_mask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_2_SHADER_READ_BIT,
+            .dst_stage_mask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dst_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+        });
+
+        vke::CommandBuffer::ColorAttachmentInfo color[] = {{
+            .image       = &image,
+            .load_op     = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .store_op    = VK_ATTACHMENT_STORE_OP_STORE,
+            .clear_value = {.float32 = {0.f, 0.f, 0.f, 0.f}},
+        }};
+        cmd.begin_rendering({
+            .width                   = width,
+            .height                  = height,
+            .color_attachments       = color,
+            .auto_layout_transitions = false,
+        });
+        cmd.bind_pipeline(waveform_pipeline);
+        cmd.set_viewport(0.f, 0.f, static_cast<float>(width), static_cast<float>(height));
+        cmd.set_scissor(0, 0, width, height);
+        vke::DescriptorSet sets[] = { waveform_desc_set };
+        cmd.bind_descriptor_sets(waveform_pipeline, sets);
+        cmd.push_constants(waveform_pipeline, VK_SHADER_STAGE_MESH_BIT_EXT, pc);
+        cmd.draw_mesh_tasks(groups_x, 1, 1);
+        cmd.end_rendering();
     }
 
     void record_batch(vke::CommandBuffer& cmd, const HistogramPC& pc,
@@ -265,6 +345,82 @@ void Histogram::draw(std::span<const Sample> samples, uint32_t trace_length,
     cmd.end();
 
     // Submit async — SubmitHandle owns the command buffer until wait() is called.
+    im.pending = im.ctx.submit(std::move(cmd));
+}
+
+void Histogram::draw_waveform(std::span<const float> samples,
+                              const WaveformParams& params) {
+    auto& im = *impl_;
+
+    VkDeviceSize needed = sizeof(float) * samples.size();
+    im.wait_pending();
+
+    if (!im.waveform_staging || im.waveform_staging.size() < needed) {
+        im.waveform_staging = im.ctx.create_buffer({
+            .size       = needed,
+            .usage      = vke::BufferUsage::TransferSrc,
+            .domain     = vke::MemoryDomain::Host,
+            .debug_name = "waveform_staging",
+        });
+    }
+    if (!im.waveform_device || im.waveform_device.size() < needed) {
+        im.waveform_device = im.ctx.create_buffer({
+            .size       = needed,
+            .usage      = vke::BufferUsage::Storage | vke::BufferUsage::TransferDst,
+            .domain     = vke::MemoryDomain::Device,
+            .debug_name = "waveform_samples",
+        });
+        im.update_waveform_desc_set();
+    }
+
+    auto dst = im.waveform_staging.mapped_as<float>();
+    std::memcpy(dst.data(), samples.data(), needed);
+
+    uint32_t n_samples = static_cast<uint32_t>(samples.size());
+    float    aspect    = static_cast<float>(im.height) / static_cast<float>(im.width);
+
+    // Clamp x_range to [0, 1] and derive which segments to render.
+    float xlo = std::max(0.0f, params.x_range.first);
+    float xhi = std::min(1.0f, params.x_range.second);
+    auto  first_seg = static_cast<uint32_t>(xlo * static_cast<float>(n_samples - 1));
+    auto  last_seg  = static_cast<uint32_t>(std::ceil(xhi * static_cast<float>(n_samples - 1)));
+    last_seg = std::min(last_seg, n_samples - 2); // max valid segment index
+    if (last_seg < first_seg) return;
+    uint32_t total_segments = last_seg - first_seg + 1;
+
+    auto cmd = im.ctx.create_command_buffer();
+    cmd.begin();
+
+    cmd.copy_buffer(im.waveform_staging, im.waveform_device, 0, 0, needed);
+    cmd.buffer_barrier({
+        .buffer          = im.waveform_device,
+        .src_stage_mask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .src_access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dst_stage_mask  = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+        .dst_access_mask = VK_ACCESS_2_SHADER_READ_BIT,
+    });
+
+    constexpr uint32_t WORKGROUP_SIZE   = 32;
+    constexpr uint32_t MAX_GROUPS_X     = 65535;
+    constexpr uint32_t MAX_SEGS_PER_BATCH = MAX_GROUPS_X * WORKGROUP_SIZE;
+
+    for (uint32_t off = 0; off < total_segments; off += MAX_SEGS_PER_BATCH) {
+        uint32_t batch_segs = std::min(total_segments - off, MAX_SEGS_PER_BATCH);
+        uint32_t groups_x   = (batch_segs + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+        WaveformPC pc{
+            .x_range        = { params.x_range.first, params.x_range.second },
+            .y_range        = { params.y_range.first, params.y_range.second },
+            .viewport_ratio = { aspect, 1.0f / aspect },
+            .line_width     = params.line_width,
+            .n_samples      = n_samples,
+            .first_segment  = first_seg + off,
+            .n_segments     = batch_segs,
+        };
+        im.record_waveform_batch(cmd, pc, groups_x);
+    }
+
+    cmd.end();
     im.pending = im.ctx.submit(std::move(cmd));
 }
 

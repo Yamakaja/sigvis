@@ -28,6 +28,11 @@ public:
     void draw(std::span<const Sample> samples, uint32_t trace_length,
               const RenderParams& params);
 
+    // Accumulate a single 1-D waveform (float32 amplitude values, uniform x spacing)
+    // into the histogram. x_range selects which portion of the signal to render and
+    // reduces the number of GPU segments accordingly.
+    void draw_waveform(std::span<const float> samples, const WaveformParams& params);
+
     // R32_SFLOAT image in COLOR_ATTACHMENT_OPTIMAL. Valid until next call or destruction.
     const vke::Image& image() const noexcept;
 

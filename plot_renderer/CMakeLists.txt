@@ -26,6 +26,7 @@ set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 compile_shaders(TARGET plot_renderer SOURCES
     "${SHADER_DIR}/lines_renderer.mesh"
     "${SHADER_DIR}/lines_renderer.frag"
+    "${SHADER_DIR}/waveform_renderer.mesh"
     "${SHADER_DIR}/histogram_sample.vert"
     "${SHADER_DIR}/histogram_sample.frag"
 )

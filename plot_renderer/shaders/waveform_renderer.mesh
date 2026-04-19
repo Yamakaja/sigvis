@@ -1,0 +1,125 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+const uint WORKGROUP_SIZE           = 32;
+const uint VERTICES_PER_INVOCATION  = 8;
+const uint TRIANGLES_PER_INVOCATION = 7;
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(triangles,
+       max_vertices   = VERTICES_PER_INVOCATION  * WORKGROUP_SIZE,
+       max_primitives = TRIANGLES_PER_INVOCATION * WORKGROUP_SIZE) out;
+
+layout(push_constant) uniform PC {
+    vec2  x_range;        // [x_min, x_max] in normalised signal coords [0, 1]
+    vec2  y_range;        // [y_min, y_max] in signal amplitude units
+    vec2  viewport_ratio; // (height/width, width/height)
+    float line_width;
+    uint  n_samples;      // total samples in the buffer
+    uint  first_segment;  // absolute index of first segment in this dispatch
+    uint  n_segments;     // segments to process in this dispatch
+} pc;
+
+layout(std430, binding = 0) readonly buffer SampleBuffer {
+    float samples[];
+};
+
+layout(location = 0) out struct Varying {
+    vec2 texCoord;
+} v_out[];
+
+// Signal coordinates → isometric screen space.
+// Matches the convention in lines_renderer.mesh: x is scaled by width/height so
+// line_width is isometric (same pixel width regardless of aspect ratio).
+vec2 signal_to_screen(uint idx, float y_val) {
+    float x_norm = float(idx) / float(pc.n_samples - 1);
+    float sx = ((x_norm - pc.x_range.x) / (pc.x_range.y - pc.x_range.x) * 2.0 - 1.0)
+               * pc.viewport_ratio.y;
+    float sy = -((y_val - pc.y_range.x) / (pc.y_range.y - pc.y_range.x) * 2.0 - 1.0);
+    return vec2(sx, sy);
+}
+
+vec4 screen_to_clip(vec2 s) {
+    return vec4(s * vec2(pc.viewport_ratio.x, 1.0), 0.0, 1.0);
+}
+
+void main() {
+    const uint wg_start   = gl_WorkGroupID.x * WORKGROUP_SIZE;
+    const uint li         = gl_LocalInvocationID.x;
+    const uint local_segs = wg_start >= pc.n_segments ? 0u
+                          : min(pc.n_segments - wg_start, WORKGROUP_SIZE);
+
+    if (li == 0)
+        SetMeshOutputsEXT(VERTICES_PER_INVOCATION  * local_segs,
+                          TRIANGLES_PER_INVOCATION * local_segs);
+
+    if (li >= local_segs)
+        return;
+
+    const uint i  = pc.first_segment + wg_start + li;
+    const uint ic = min(i + 2, pc.n_samples - 1);
+
+    vec2 a = signal_to_screen(i,     samples[i    ]);
+    vec2 b = signal_to_screen(i + 1, samples[i + 1]);
+    vec2 c = signal_to_screen(ic,    samples[ic   ]);
+
+    if (i > 0)                   a = 0.5 * (b - a) + a;
+    if (i + 2 < pc.n_samples)    c = 0.5 * (b - c) + c;
+
+    a = a;  // already in screen space
+    b = b;
+    c = c;
+
+    vec2 ab = (b - a) * inversesqrt(dot(b - a, b - a));
+    vec2 cb = (b - c) * inversesqrt(dot(b - c, b - c));
+
+    bool  benddir = ab.x * cb.y - ab.y * cb.x < 0.0;
+    float bendfac = benddir ? -1.0 : 1.0;
+
+    vec2 pa = bendfac * pc.line_width * vec2(-ab.y,  ab.x);
+    vec2 pb = bendfac * pc.line_width * vec2( cb.y, -cb.x);
+
+    uint vo = VERTICES_PER_INVOCATION * li;
+    gl_MeshVerticesEXT[vo + 0].gl_Position = screen_to_clip(a + pa);
+    gl_MeshVerticesEXT[vo + 1].gl_Position = screen_to_clip(a - pa);
+    gl_MeshVerticesEXT[vo + 2].gl_Position = screen_to_clip(b + pa);
+
+    float beta = acos(clamp(-dot(ab, cb), -1.0, 1.0));
+    float d    = pc.line_width * clamp(1.0 / cos(beta * 0.5), -4.0, 4.0);
+    gl_MeshVerticesEXT[vo + 3].gl_Position = screen_to_clip(b - d * normalize(pa + pb));
+
+    gl_MeshVerticesEXT[vo + 4].gl_Position = screen_to_clip(b);
+    gl_MeshVerticesEXT[vo + 5].gl_Position = screen_to_clip(b + pb);
+    gl_MeshVerticesEXT[vo + 6].gl_Position = screen_to_clip(c - pb);
+    gl_MeshVerticesEXT[vo + 7].gl_Position = screen_to_clip(c + pb);
+
+    v_out[vo + 0].texCoord = vec2(0.0,  1.0);
+    v_out[vo + 1].texCoord = vec2(0.0, -1.0);
+    v_out[vo + 2].texCoord = vec2(1.0,  1.0);
+    v_out[vo + 3].texCoord = vec2(1.0, -1.0);
+    v_out[vo + 4].texCoord = vec2(1.0,  0.0);
+    v_out[vo + 5].texCoord = vec2(0.0,  1.0);
+    v_out[vo + 6].texCoord = vec2(1.0, -1.0);
+    v_out[vo + 7].texCoord = vec2(1.0,  1.0);
+
+    uint to = VERTICES_PER_INVOCATION  * li;
+    uint bo = TRIANGLES_PER_INVOCATION * li;
+
+    if (benddir) {
+        gl_PrimitiveTriangleIndicesEXT[bo + 0] = to + uvec3(0, 1, 2);
+        gl_PrimitiveTriangleIndicesEXT[bo + 1] = to + uvec3(2, 1, 4);
+        gl_PrimitiveTriangleIndicesEXT[bo + 2] = to + uvec3(4, 1, 3);
+        gl_PrimitiveTriangleIndicesEXT[bo + 3] = to + uvec3(5, 2, 4);
+        gl_PrimitiveTriangleIndicesEXT[bo + 4] = to + uvec3(5, 6, 7);
+        gl_PrimitiveTriangleIndicesEXT[bo + 5] = to + uvec3(5, 4, 6);
+        gl_PrimitiveTriangleIndicesEXT[bo + 6] = to + uvec3(4, 3, 6);
+    } else {
+        gl_PrimitiveTriangleIndicesEXT[bo + 0] = to + uvec3(0, 2, 1);
+        gl_PrimitiveTriangleIndicesEXT[bo + 1] = to + uvec3(2, 4, 1);
+        gl_PrimitiveTriangleIndicesEXT[bo + 2] = to + uvec3(4, 3, 1);
+        gl_PrimitiveTriangleIndicesEXT[bo + 3] = to + uvec3(5, 4, 2);
+        gl_PrimitiveTriangleIndicesEXT[bo + 4] = to + uvec3(5, 7, 6);
+        gl_PrimitiveTriangleIndicesEXT[bo + 5] = to + uvec3(5, 6, 4);
+        gl_PrimitiveTriangleIndicesEXT[bo + 6] = to + uvec3(4, 6, 3);
+    }
+}
