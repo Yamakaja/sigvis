@@ -2,6 +2,7 @@
 
 import sys
 import pathlib
+import time
 import numpy as np
 from PIL import Image
 import matplotlib.cm as mcm
@@ -113,17 +114,32 @@ def render_batched(
     rng = np.random.default_rng(0)
     n_batches = (total_traces + batch_size - 1) // batch_size
     rendered = 0
+    t_dsp_total = 0.0
+    t_render_total = 0.0
 
     for i in range(n_batches):
         n = min(batch_size, total_traces - rendered)
+
+        t0 = time.perf_counter()
         batch = make_sinusoid_traces(n_traces=n, samples_per_trace=samples_per_trace,
                                      amplitude_variation=0.05)
+        t_dsp_total += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         hist.draw(batch, x_range=(0.0, 1.0), y_range=(-1.5, 1.5), line_width=5e-3)
+        t_render_total += time.perf_counter() - t0
+
         rendered += n
         print(f"  [{i+1}/{n_batches}] {rendered:>10,} / {total_traces:,} traces", flush=True)
 
+    t0 = time.perf_counter()
     data = hist.download()
+    t_download = time.perf_counter() - t0
+
     print(f"Histogram: shape={data.shape}, min={data.min():.4f}, max={data.max():.4f}")
+    print(f"  DSP:      {t_dsp_total*1e3:7.1f} ms total")
+    print(f"  draw():   {t_render_total*1e3:7.1f} ms total  (memcpy + submit, GPU runs async)")
+    print(f"  download:{t_download*1e3:7.1f} ms  (flush + readback)")
     frame = apply_colormap(data)
     out = pathlib.Path(__file__).parent / "eye_diagram_batched.png"
     Image.fromarray(frame, "RGBA").save(out)
@@ -131,36 +147,76 @@ def render_batched(
     del hist
 
 
+def make_rcf_filter(sps: int, beta: float, n_syms: int = 8) -> np.ndarray:
+    """Raised cosine filter kernel spanning ±n_syms/2 symbol periods."""
+    half = n_syms // 2
+    t = np.linspace(-half, half, n_syms * sps + 1)
+    h, _ = sigutils.rcf(t, np.ones(1), beta)
+    return h
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def _overlap_save_circular(x: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """
+    Overlap-save convolution treating x as periodic: the first block's overlap
+    is taken from the tail of x so every output sample sees steady-state filter
+    context — no startup transients at the trace boundaries in the eye diagram.
+    All blocks are processed in one batched FFT call (no Python loop).
+    """
+    M = len(h) - 1                          # filter memory
+    block_size = _next_pow2(4 * len(h))     # power-of-2 FFT size
+    step = block_size - M                   # new samples per block
+    N = len(x)
+
+    # Pad signal to a multiple of step, wrapping circularly.
+    pad = (-N) % step
+    x_pad = np.concatenate([x, x[:pad]]) if pad else x
+    N_p = N + pad
+
+    # Prepend the last M samples for circular first-block overlap.
+    x_ext = np.concatenate([x_pad[-M:], x_pad])  # length M + N_p
+
+    H = np.fft.rfft(h, n=block_size)
+
+    # Build all blocks as a strided view (no copy) → batch FFT in one call.
+    blocks = np.lib.stride_tricks.sliding_window_view(x_ext, block_size)[::step]
+    # shape: (N_p // step, block_size)
+    Y = np.fft.irfft(np.fft.rfft(blocks, axis=1) * H[None, :], n=block_size, axis=1)
+    return Y[:, M:].ravel()[:N].astype(np.float32)
+
+
 def make_pam4_eye_traces(
     n_symbols: int = 65536,
     sps: int = 64,
-    beta: float = 0.35,
     noise_sigma: float = 0.02,
     rng: np.random.Generator | None = None,
+    h: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Generate PAM4 eye diagram traces via raised cosine filtering.
-    Returns float32 array of shape (n_symbols, 2*sps, 2): [x, y].
+    Returns float32 array of shape (n_symbols//2, 2*sps, 2): [x, y].
     Each trace spans two symbol periods; x is normalised to [-1, 1].
+    Pass precomputed h (from make_rcf_filter) to avoid recomputing it each call.
     """
     if rng is None:
         rng = np.random.default_rng(0)
+    if h is None:
+        h = make_rcf_filter(sps, beta=0.8)
 
     C = np.array([-3, -1, 1, 3], dtype=np.float64) / np.sqrt(5)
     symbols = C[rng.integers(0, 4, n_symbols)]
-
     if noise_sigma > 0:
         symbols += noise_sigma * rng.standard_normal(n_symbols)
 
     upsampled = np.zeros(n_symbols * sps)
     upsampled[::sps] = symbols
 
-    t = np.linspace(-128, 128, 256 * sps + 1)
-    h, _ = sigutils.rcf(t, np.ones(1), beta)
-    filtered = sigutils.cconv(upsampled, h).real.astype(np.float32)
+    filtered = _overlap_save_circular(upsampled, h)
 
-    # Reshape: each row = one 2-symbol-period eye trace; n_symbols//2 traces total
-    traces = filtered[: n_symbols * sps].reshape(n_symbols // 2, 2 * sps)
+    traces = filtered.reshape(n_symbols // 2, 2 * sps)
     x = np.broadcast_to(
         np.linspace(-1.0, 1.0, 2 * sps, endpoint=False, dtype=np.float32),
         traces.shape,
@@ -181,16 +237,34 @@ def render_pam4_eye(
     rng = np.random.default_rng(0)
     n_batches = (total_symbols + batch_size - 1) // batch_size
     rendered = 0
+    t_dsp_total = 0.0
+    t_render_total = 0.0
+
+    h = make_rcf_filter(sps, beta=0.8)
 
     for i in range(n_batches):
         n = min(batch_size, total_symbols - rendered)
-        batch = make_pam4_eye_traces(n_symbols=n, sps=sps, rng=rng, beta=0.8, noise_sigma=0.01)
+
+        t0 = time.perf_counter()
+        batch = make_pam4_eye_traces(n_symbols=n, sps=sps, rng=rng,
+                                     noise_sigma=0.004, h=h)
+        t_dsp_total += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         hist.draw(batch, x_range=(-1.0, 1.0), y_range=(-2.0, 2.0), line_width=1e-3)
+        t_render_total += time.perf_counter() - t0
+
         rendered += n
         print(f"  [{i+1}/{n_batches}] {rendered:>10,} / {total_symbols:,} symbols", flush=True)
 
+    t0 = time.perf_counter()
     data = hist.download()
+    t_download = time.perf_counter() - t0
+
     print(f"Histogram: shape={data.shape}, min={data.min():.4f}, max={data.max():.4f}")
+    print(f"  DSP:      {t_dsp_total*1e3:7.1f} ms total")
+    print(f"  draw():   {t_render_total*1e3:7.1f} ms total  (memcpy + submit, GPU runs async)")
+    print(f"  download:{t_download*1e3:7.1f} ms  (flush + readback)")
     frame = apply_colormap(data)
     out = pathlib.Path(__file__).parent / "pam4_eye.png"
     Image.fromarray(frame, "RGBA").save(out)

@@ -164,6 +164,7 @@ public:
     }
 
     py::array_t<float> download() {
+        hist_.flush();
         auto raw = hist_.image().download();
         py::array_t<float> out(
             { static_cast<py::ssize_t>(hist_.height()),

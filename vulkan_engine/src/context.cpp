@@ -928,8 +928,8 @@ SubmitHandle Context::submit(CommandBuffer cmd) {
     };
     VkFence fence = acquire_fence();
     VKE_CHECK(vkQueueSubmit2(graphics_.queue, 1, &si, fence));
-    // cmd destructor called here — frees command buffer
-    return SubmitHandle(device_, fence);
+    auto [dev, pool, buf] = cmd.detach(); // transfer ownership to SubmitHandle
+    return SubmitHandle(device_, fence, pool, buf);
 }
 
 void Context::wait(SubmitHandle& handle) {

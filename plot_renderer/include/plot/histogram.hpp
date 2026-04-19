@@ -17,6 +17,9 @@ public:
     Histogram(Histogram&&) noexcept;
     Histogram& operator=(Histogram&&) noexcept;
 
+    // Wait for any in-flight draw() to complete. Called implicitly by download().
+    void flush();
+
     // Zero the histogram image on the GPU.
     void clear();
 

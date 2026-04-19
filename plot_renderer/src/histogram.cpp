@@ -1,6 +1,7 @@
 #include <plot/histogram.hpp>
 #include <vke/vke.hpp>
 #include <algorithm>
+#include <cstring>
 
 #include "shaders/lines_renderer_mesh_spv.hpp"
 #include "shaders/lines_renderer_frag_spv.hpp"
@@ -36,8 +37,10 @@ struct Histogram::Impl {
     uint32_t      width;
     uint32_t      height;
 
-    vke::Image           image;
-    vke::Buffer          sample_buffer;
+    vke::Image            image;
+    vke::Buffer           staging_buffer;   // host-visible, persistently mapped
+    vke::Buffer           sample_buffer;    // device-local
+    vke::SubmitHandle     pending;          // in-flight fence + owns the command buffer
     vke::DescriptorLayout desc_layout;
     vke::DescriptorSet    desc_set;
     vke::Pipeline         pipeline;
@@ -92,13 +95,18 @@ struct Histogram::Impl {
         });
     }
 
+    // Block until any in-flight command buffer has completed.
+    void wait_pending() {
+        if (pending.is_valid())
+            ctx.wait(pending);
+    }
+
     void update_desc_set() {
         desc_set.write().bind_storage_buffer(0, sample_buffer).commit();
     }
 
-    // Single draw pass; clear=true zeroes the image, false accumulates.
     void record_batch(vke::CommandBuffer& cmd, const HistogramPC& pc,
-                      uint32_t batch_traces, uint32_t groups_y, bool clear) {
+                      uint32_t batch_traces, uint32_t groups_y) {
         cmd.image_barrier({
             .image           = image,
             .new_layout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -113,7 +121,7 @@ struct Histogram::Impl {
 
         vke::CommandBuffer::ColorAttachmentInfo color[] = {{
             .image       = &image,
-            .load_op     = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .load_op     = VK_ATTACHMENT_LOAD_OP_LOAD,
             .store_op    = VK_ATTACHMENT_STORE_OP_STORE,
             .clear_value = {.float32 = {0.f, 0.f, 0.f, 0.f}},
         }};
@@ -140,8 +148,8 @@ Histogram::Histogram(vke::Context& ctx, uint32_t width, uint32_t height)
     : impl_(std::make_unique<Impl>(ctx, width, height))
 {}
 
-Histogram::~Histogram()                            = default;
-Histogram::Histogram(Histogram&&) noexcept         = default;
+Histogram::~Histogram()                               = default;
+Histogram::Histogram(Histogram&&) noexcept            = default;
 Histogram& Histogram::operator=(Histogram&&) noexcept = default;
 
 uint32_t Histogram::width()  const noexcept { return impl_->width; }
@@ -149,8 +157,14 @@ uint32_t Histogram::height() const noexcept { return impl_->height; }
 
 const vke::Image& Histogram::image() const noexcept { return impl_->image; }
 
+void Histogram::flush() {
+    impl_->wait_pending();
+}
+
 void Histogram::clear() {
     auto& im = *impl_;
+    im.wait_pending();
+
     auto cmd = im.ctx.create_command_buffer();
     cmd.begin();
     cmd.image_barrier({
@@ -182,18 +196,35 @@ void Histogram::draw(std::span<const Sample> samples, uint32_t trace_length,
                      const RenderParams& params) {
     auto& im = *impl_;
 
-    // Upload samples, reallocating the buffer if needed.
     VkDeviceSize needed = sizeof(Sample) * samples.size();
+
+    // Block only if the staging buffer is still in use by an in-flight transfer.
+    // This is the only point where we stall; after this the caller's data is safe
+    // to modify as soon as we return.
+    im.wait_pending();
+
+    // Grow buffers if needed (safe now that pending work is done).
+    if (!im.staging_buffer || im.staging_buffer.size() < needed) {
+        im.staging_buffer = im.ctx.create_buffer({
+            .size       = needed,
+            .usage      = vke::BufferUsage::TransferSrc,
+            .domain     = vke::MemoryDomain::Host,
+            .debug_name = "histogram_staging",
+        });
+    }
     if (!im.sample_buffer || im.sample_buffer.size() < needed) {
         im.sample_buffer = im.ctx.create_buffer({
             .size       = needed,
-            .usage      = vke::BufferUsage::Storage,
+            .usage      = vke::BufferUsage::Storage | vke::BufferUsage::TransferDst,
             .domain     = vke::MemoryDomain::Device,
             .debug_name = "histogram_samples",
         });
         im.update_desc_set();
     }
-    im.sample_buffer.upload<Sample>(samples);
+
+    // Copy into staging — after this line the caller's buffer is safe to reuse.
+    auto dst = im.staging_buffer.mapped_as<Sample>();
+    std::memcpy(dst.data(), samples.data(), needed);
 
     uint32_t n_samples = static_cast<uint32_t>(samples.size());
     uint32_t spt       = trace_length > 0 ? trace_length : n_samples;
@@ -211,18 +242,30 @@ void Histogram::draw(std::span<const Sample> samples, uint32_t trace_length,
         .trace_offset        = 0,
     };
 
-    constexpr uint32_t MAX_PER_SUBMIT = 65535;
-    for (uint32_t offset = 0; offset < n_traces; offset += MAX_PER_SUBMIT) {
-        uint32_t batch   = std::min(n_traces - offset, MAX_PER_SUBMIT);
-        HistogramPC pc   = base_pc;
-        pc.trace_offset  = offset;
+    // Build one command buffer: staging→device transfer, then all render batches.
+    auto cmd = im.ctx.create_command_buffer();
+    cmd.begin();
 
-        auto cmd = im.ctx.create_command_buffer();
-        cmd.begin();
-        im.record_batch(cmd, pc, batch, groups_y, /*clear=*/false);
-        cmd.end();
-        im.ctx.submit_and_wait(std::move(cmd));
+    cmd.copy_buffer(im.staging_buffer, im.sample_buffer, 0, 0, needed);
+    cmd.buffer_barrier({
+        .buffer          = im.sample_buffer,
+        .src_stage_mask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .src_access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dst_stage_mask  = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+        .dst_access_mask = VK_ACCESS_2_SHADER_READ_BIT,
+    });
+
+    constexpr uint32_t MAX_PER_BATCH = 65535;
+    for (uint32_t offset = 0; offset < n_traces; offset += MAX_PER_BATCH) {
+        HistogramPC pc  = base_pc;
+        pc.trace_offset = offset;
+        im.record_batch(cmd, pc, std::min(n_traces - offset, MAX_PER_BATCH), groups_y);
     }
+
+    cmd.end();
+
+    // Submit async — SubmitHandle owns the command buffer until wait() is called.
+    im.pending = im.ctx.submit(std::move(cmd));
 }
 
 } // namespace plot

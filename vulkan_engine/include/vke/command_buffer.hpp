@@ -151,6 +151,17 @@ public:
 
     VkCommandBuffer native_handle() const noexcept { return cmd_; }
 
+    // Relinquish ownership of the raw handles so the caller can manage lifetime.
+    // After this the CommandBuffer destructor is a no-op.
+    struct RawHandles { VkDevice device; VkCommandPool pool; VkCommandBuffer cmd; };
+    RawHandles detach() noexcept {
+        RawHandles h{ device_, pool_, cmd_ };
+        device_ = VK_NULL_HANDLE;
+        pool_   = VK_NULL_HANDLE;
+        cmd_    = VK_NULL_HANDLE;
+        return h;
+    }
+
 private:
     friend class Context;
 
