@@ -314,12 +314,31 @@ void Context::create_device(const ContextCreateInfo& info) {
     // Fill device info
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physical_dev_, &props);
-    device_info_.device_name    = props.deviceName;
-    device_info_.device_type    = props.deviceType;
-    device_info_.api_version    = props.apiVersion;
+    device_info_.device_name      = props.deviceName;
+    device_info_.device_type      = props.deviceType;
+    device_info_.api_version      = props.apiVersion;
     device_info_.has_mesh_shaders = check_device_ext(physical_dev_, VK_EXT_MESH_SHADER_EXTENSION_NAME);
     device_info_.has_task_shaders = device_info_.has_mesh_shaders;
-    device_info_.limits         = props.limits;
+    device_info_.limits           = props.limits;
+
+    if (device_info_.has_mesh_shaders) {
+        VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT,
+        };
+        VkPhysicalDeviceProperties2 props2{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &mesh_props,
+        };
+        vkGetPhysicalDeviceProperties2(physical_dev_, &props2);
+        auto& ml = device_info_.mesh_limits;
+        ml.max_work_group_count[0]  = mesh_props.maxMeshWorkGroupCount[0];
+        ml.max_work_group_count[1]  = mesh_props.maxMeshWorkGroupCount[1];
+        ml.max_work_group_count[2]  = mesh_props.maxMeshWorkGroupCount[2];
+        ml.max_work_group_total     = mesh_props.maxMeshWorkGroupTotalCount;
+        ml.max_output_vertices      = mesh_props.maxMeshOutputVertices;
+        ml.max_output_primitives    = mesh_props.maxMeshOutputPrimitives;
+        ml.preferred_work_group_size = mesh_props.maxPreferredMeshWorkGroupInvocations;
+    }
 }
 
 // ---- VMA ----

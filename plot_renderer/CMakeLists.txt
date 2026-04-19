@@ -1,5 +1,6 @@
 add_library(plot_renderer STATIC
     src/eye_diagram_renderer.cpp
+    src/histogram.cpp
 )
 add_library(plot::plot_renderer ALIAS plot_renderer)
 

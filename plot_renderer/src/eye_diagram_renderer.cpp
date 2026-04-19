@@ -19,8 +19,9 @@ struct HistogramPC {
     float     line_width;
     uint32_t  n_samples;
     uint32_t  n_samples_per_trace;
+    uint32_t  trace_offset;
 };
-static_assert(sizeof(HistogramPC) == 36);
+static_assert(sizeof(HistogramPC) == 40);
 
 struct CompositePC {
     float max_intensity;
@@ -213,22 +214,25 @@ struct EyeDiagramRenderer::Impl {
             .commit();
     }
 
-    // Records the histogram pass into cmd. Leaves histogram_image in
-    // COLOR_ATTACHMENT_OPTIMAL. Call one of the two transition helpers after.
-    void record_histogram(vke::CommandBuffer& cmd, const HistogramPC& pc,
-                          uint32_t n_traces, uint32_t groups_y) {
+    // Records one histogram batch into cmd. clear=true on first batch, false for accumulation.
+    // Leaves histogram_image in COLOR_ATTACHMENT_OPTIMAL.
+    void record_histogram_batch(vke::CommandBuffer& cmd, const HistogramPC& pc,
+                                uint32_t batch_traces, uint32_t groups_y, bool clear) {
         cmd.image_barrier({
             .image           = histogram_image,
             .new_layout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .src_stage_mask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .src_access_mask = VK_ACCESS_2_SHADER_READ_BIT,
+            .src_stage_mask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_2_SHADER_READ_BIT,
             .dst_stage_mask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .dst_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
         });
 
         vke::CommandBuffer::ColorAttachmentInfo hist_color[] = {{
             .image       = &histogram_image,
-            .load_op     = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .load_op     = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .store_op    = VK_ATTACHMENT_STORE_OP_STORE,
             .clear_value = {.float32 = {0.f, 0.f, 0.f, 0.f}},
         }};
@@ -247,9 +251,25 @@ struct EyeDiagramRenderer::Impl {
         vke::DescriptorSet sets[] = { histogram_desc_set };
         cmd.bind_descriptor_sets(histogram_pipeline, sets);
         cmd.push_constants(histogram_pipeline, VK_SHADER_STAGE_MESH_BIT_EXT, pc);
-
-        cmd.draw_mesh_tasks(n_traces, groups_y, 1);
+        cmd.draw_mesh_tasks(batch_traces, groups_y, 1);
         cmd.end_rendering();
+    }
+
+    // Submits histogram batches one submission at a time to avoid GPU watchdog timeouts.
+    static constexpr uint32_t MAX_TRACES_PER_SUBMIT = 65535;
+
+    void submit_histogram_batches(const HistogramPC& base_pc,
+                                  uint32_t n_traces, uint32_t groups_y) {
+        for (uint32_t offset = 0; offset < n_traces; offset += MAX_TRACES_PER_SUBMIT) {
+            uint32_t batch    = std::min(n_traces - offset, MAX_TRACES_PER_SUBMIT);
+            HistogramPC pc    = base_pc;
+            pc.trace_offset   = offset;
+            auto cmd = ctx.create_command_buffer();
+            cmd.begin();
+            record_histogram_batch(cmd, pc, batch, groups_y, /*clear=*/offset == 0);
+            cmd.end();
+            ctx.submit_and_wait(std::move(cmd));
+        }
     }
 
     // Prepares the push constants and dispatch dimensions from current state.
@@ -308,15 +328,7 @@ const vke::Image& EyeDiagramRenderer::render_histogram(const RenderParams& param
 
     uint32_t n_traces, groups_y;
     HistogramPC pc = im.make_histogram_pc(params, n_traces, groups_y);
-
-    auto cmd = im.ctx.create_command_buffer();
-    cmd.begin();
-    cmd.begin_debug_label("EyeDiagram/Histogram");
-    im.record_histogram(cmd, pc, n_traces, groups_y);
-    cmd.end_debug_label();
-    cmd.end();
-    im.ctx.submit_and_wait(std::move(cmd));
-
+    im.submit_histogram_batches(pc, n_traces, groups_y);
     return im.histogram_image;
 }
 
@@ -328,13 +340,11 @@ const vke::Image& EyeDiagramRenderer::render(const RenderParams& params) {
     HistogramPC hist_pc = im.make_histogram_pc(params, n_traces, groups_y);
     CompositePC comp_pc{ .max_intensity = params.max_intensity };
 
+    im.submit_histogram_batches(hist_pc, n_traces, groups_y);
+
+    // histogram_image is now COLOR_ATTACHMENT_OPTIMAL; composite it into result_image
     auto cmd = im.ctx.create_command_buffer();
     cmd.begin();
-    cmd.begin_debug_label("EyeDiagram");
-
-    cmd.begin_debug_label("Histogram");
-    im.record_histogram(cmd, hist_pc, n_traces, groups_y);
-    cmd.end_debug_label();
 
     cmd.image_barrier({
         .image           = im.histogram_image,
@@ -353,32 +363,27 @@ const vke::Image& EyeDiagramRenderer::render(const RenderParams& params) {
         .dst_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
     });
 
-    cmd.begin_debug_label("Composite");
-    {
-        vke::CommandBuffer::ColorAttachmentInfo comp_color[] = {{
-            .image       = &im.result_image,
-            .load_op     = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .store_op    = VK_ATTACHMENT_STORE_OP_STORE,
-            .clear_value = {.float32 = {0.f, 0.f, 0.f, 1.f}},
-        }};
-        cmd.begin_rendering({
-            .width                   = im.width,
-            .height                  = im.height,
-            .color_attachments       = comp_color,
-            .depth_attachment        = {},
-            .auto_layout_transitions = false,
-        });
-        cmd.bind_pipeline(im.composite_pipeline);
-        cmd.set_viewport(0.f, 0.f, static_cast<float>(im.width), static_cast<float>(im.height));
-        cmd.set_scissor(0, 0, im.width, im.height);
-        vke::DescriptorSet sets[] = { im.composite_desc_set };
-        cmd.bind_descriptor_sets(im.composite_pipeline, sets);
-        cmd.push_constants(im.composite_pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, comp_pc);
-        cmd.draw(3);
-        cmd.end_rendering();
-    }
-    cmd.end_debug_label();
-    cmd.end_debug_label(); // EyeDiagram
+    vke::CommandBuffer::ColorAttachmentInfo comp_color[] = {{
+        .image       = &im.result_image,
+        .load_op     = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .store_op    = VK_ATTACHMENT_STORE_OP_STORE,
+        .clear_value = {.float32 = {0.f, 0.f, 0.f, 1.f}},
+    }};
+    cmd.begin_rendering({
+        .width                   = im.width,
+        .height                  = im.height,
+        .color_attachments       = comp_color,
+        .depth_attachment        = {},
+        .auto_layout_transitions = false,
+    });
+    cmd.bind_pipeline(im.composite_pipeline);
+    cmd.set_viewport(0.f, 0.f, static_cast<float>(im.width), static_cast<float>(im.height));
+    cmd.set_scissor(0, 0, im.width, im.height);
+    vke::DescriptorSet sets[] = { im.composite_desc_set };
+    cmd.bind_descriptor_sets(im.composite_pipeline, sets);
+    cmd.push_constants(im.composite_pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, comp_pc);
+    cmd.draw(3);
+    cmd.end_rendering();
 
     cmd.end();
     im.ctx.submit_and_wait(std::move(cmd));

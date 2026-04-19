@@ -20,6 +20,14 @@
 
 namespace vke {
 
+struct MeshShaderLimits {
+    uint32_t max_work_group_count[3];  // maxMeshWorkGroupCount[0..2]
+    uint32_t max_work_group_total;     // maxMeshWorkGroupTotalCount
+    uint32_t max_output_vertices;
+    uint32_t max_output_primitives;
+    uint32_t preferred_work_group_size;
+};
+
 struct PhysicalDeviceInfo {
     std::string              device_name;
     VkPhysicalDeviceType     device_type;
@@ -27,6 +35,7 @@ struct PhysicalDeviceInfo {
     bool                     has_mesh_shaders;
     bool                     has_task_shaders;
     VkPhysicalDeviceLimits   limits;
+    MeshShaderLimits         mesh_limits;
 };
 
 struct ContextCreateInfo {

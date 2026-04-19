@@ -18,6 +18,7 @@ layout(push_constant) uniform PC {
     float line_width;
     uint  n_samples;
     uint  n_samples_per_trace;
+    uint  trace_offset;
 } pc;
 
 struct Vertex {
@@ -45,7 +46,7 @@ vec4 screen_to_clip(vec2 x) {
 }
 
 void main() {
-    const uint i_trace        = gl_WorkGroupID.x;
+    const uint i_trace        = gl_WorkGroupID.x + pc.trace_offset;
     const uint i_trace_sample = gl_WorkGroupID.y * WORKGROUP_SIZE + gl_LocalInvocationID.x;
     const uint li             = gl_LocalInvocationID.x;
 
