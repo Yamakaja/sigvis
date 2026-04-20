@@ -33,6 +33,11 @@ public:
     // reduces the number of GPU segments accordingly.
     void draw_waveform(std::span<const float> samples, const WaveformParams& params);
 
+    // Free the sample/waveform staging and device buffers to recover GPU memory.
+    // Blocks until any in-flight GPU work is complete. Safe to call between renders;
+    // draw() and draw_waveform() will reallocate on next use.
+    void release_buffers();
+
     // R32_SFLOAT image in COLOR_ATTACHMENT_OPTIMAL. Valid until next call or destruction.
     const vke::Image& image() const noexcept;
 

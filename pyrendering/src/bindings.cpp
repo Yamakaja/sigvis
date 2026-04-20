@@ -26,7 +26,9 @@ static vke::Context& get_context() {
 }
 
 class PyEyeDiagramRenderer;
+class PyHistogram;
 static std::unordered_set<PyEyeDiagramRenderer*> g_live_renderers;
+static std::unordered_set<PyHistogram*>          g_live_histograms;
 
 class PyEyeDiagramRenderer {
 public:
@@ -126,7 +128,18 @@ class PyHistogram {
 public:
     PyHistogram(uint32_t width, uint32_t height)
         : hist_(get_context(), width, height)
-    {}
+    {
+        g_live_histograms.insert(this);
+    }
+
+    ~PyHistogram() {
+        g_live_histograms.erase(this);
+    }
+
+    // Called by shutdown() before the context is destroyed.
+    void release_gpu_resources() {
+        hist_ = plot::Histogram();
+    }
 
     void clear() { hist_.clear(); }
 
@@ -182,6 +195,8 @@ public:
         };
         hist_.draw_waveform(samples, params);
     }
+
+    void release_buffers() { hist_.release_buffers(); }
 
     py::array_t<float> download() {
         hist_.flush();
@@ -249,6 +264,10 @@ PYBIND11_MODULE(pyrendering, m) {
              "x_range selects which portion of the signal to render.")
         .def("download", &PyHistogram::download,
              "Download current histogram state as a (H, W) float32 numpy array.")
+        .def("release_buffers", &PyHistogram::release_buffers,
+             "Free GPU sample/waveform buffers to recover device memory. "
+             "Blocks until any in-flight GPU work is complete. "
+             "Buffers are reallocated automatically on the next draw() or draw_waveform() call.")
         .def_property_readonly("width",  &PyHistogram::width)
         .def_property_readonly("height", &PyHistogram::height);
 
@@ -278,9 +297,10 @@ PYBIND11_MODULE(pyrendering, m) {
           "Configure context options before first use. Must be called before creating any renderer.");
 
     m.def("shutdown", []() {
-              // Release GPU resources on all live renderers before destroying the context.
               for (auto* r : g_live_renderers)
                   r->release_gpu_resources();
+              for (auto* h : g_live_histograms)
+                  h->release_gpu_resources();
               g_context.reset();
               g_validation_layers = false;
           },

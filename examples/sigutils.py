@@ -44,6 +44,44 @@ def rrcf(t, f, beta):
     
     return h,H
 
+def rcf_signal(n_symbols, sps, beta, C, filter_length=8, rng=None):
+    """Generate a pulse-shaped signal from constellation C.
+
+    Symbols are drawn uniformly from C, upsampled to sps samples/symbol,
+    then convolved with a raised cosine filter via circular convolution so
+    the filter wraps at the signal boundary — no startup transients.
+
+    Parameters
+    ----------
+    n_symbols     : number of symbols to generate
+    sps           : samples per symbol
+    beta          : RCF roll-off factor (0 < beta <= 1)
+    C             : 1-D constellation array (real or complex)
+    filter_length : one-sided filter length in symbols;
+                    the kernel spans [-filter_length, +filter_length] symbol periods
+    rng           : numpy Generator (created fresh if None)
+
+    Returns
+    -------
+    float32 (real C) or complex64 (complex C) ndarray of length n_symbols * sps
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    C = np.asarray(C)
+    symbols = C[rng.integers(0, len(C), n_symbols)]
+
+    upsampled = np.zeros(n_symbols * sps, dtype=np.complex128 if np.iscomplexobj(C) else np.float64)
+    upsampled[::sps] = symbols
+
+    t = np.arange(-filter_length * sps, filter_length * sps + 1) / sps
+    h, _ = rcf(t, np.ones(1), beta)
+
+    out = cconv(upsampled, h)
+    if np.iscomplexobj(C):
+        return out.astype(np.complex64)
+    return out.real.astype(np.float32)
+
+
 def phase_noise(delta_f, T_s, size):
     return np.cumsum(np.sqrt(2*np.pi*delta_f*T_s) * np.random.randn(size))
 

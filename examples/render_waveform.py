@@ -37,7 +37,7 @@ def render_square_wave(width: int = 1920, height: int = 1080) -> None:
 
     hist = pr.Histogram(width, height)
     hist.clear()
-    hist.draw_waveform(signal, x_range=(0.0, 1.0), y_range=(-1.5, 1.5), line_width=3e-3)
+    hist.draw_waveform(signal, x_range=(0.0, 1.0), y_range=(-1.5, 1.5), line_width=1e-3)
 
     data = hist.download()
     print(f"Histogram: shape={data.shape}, min={data.min():.4f}, max={data.max():.4f}")

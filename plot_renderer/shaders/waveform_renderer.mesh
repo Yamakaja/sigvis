@@ -5,6 +5,9 @@ const uint WORKGROUP_SIZE           = 32;
 const uint VERTICES_PER_INVOCATION  = 8;
 const uint TRIANGLES_PER_INVOCATION = 7;
 
+const uint BOX_VERTICES_PER_INVOCATION  = 4;
+const uint BOX_TRIANGLES_PER_INVOCATION = 2;
+
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 layout(triangles,
        max_vertices   = VERTICES_PER_INVOCATION  * WORKGROUP_SIZE,
@@ -18,6 +21,7 @@ layout(push_constant) uniform PC {
     uint  n_samples;      // total samples in the buffer
     uint  first_segment;  // absolute index of first segment in this dispatch
     uint  n_segments;     // segments to process in this dispatch
+    uint  viewport_width; // render target width in pixels
 } pc;
 
 layout(std430, binding = 0) readonly buffer SampleBuffer {
@@ -49,26 +53,56 @@ void main() {
     const uint local_segs = wg_start >= pc.n_segments ? 0u
                           : min(pc.n_segments - wg_start, WORKGROUP_SIZE);
 
-    if (li == 0)
-        SetMeshOutputsEXT(VERTICES_PER_INVOCATION  * local_segs,
-                          TRIANGLES_PER_INVOCATION * local_segs);
+    // Pixels per segment is uniform across the dispatch (push-constant only),
+    // so all workgroups take the same branch and SetMeshOutputsEXT is consistent.
+    float pixels_per_segment = float(pc.viewport_width)
+        / (float(pc.n_samples - 1) * (pc.x_range.y - pc.x_range.x));
+    bool box_mode = pixels_per_segment < 1.0;
+
+    if (li == 0) {
+        uint verts = box_mode ? BOX_VERTICES_PER_INVOCATION * local_segs
+                              : VERTICES_PER_INVOCATION     * local_segs;
+        uint prims = box_mode ? BOX_TRIANGLES_PER_INVOCATION * local_segs
+                              : TRIANGLES_PER_INVOCATION     * local_segs;
+        SetMeshOutputsEXT(verts, prims);
+    }
 
     if (li >= local_segs)
         return;
 
-    const uint i  = pc.first_segment + wg_start + li;
-    const uint ic = min(i + 2, pc.n_samples - 1);
+    const uint i = pc.first_segment + wg_start + li;
 
     vec2 a = signal_to_screen(i,     samples[i    ]);
     vec2 b = signal_to_screen(i + 1, samples[i + 1]);
-    vec2 c = signal_to_screen(ic,    samples[ic   ]);
+
+    if (box_mode) {
+        float x_mid = 0.5 * (a.x + b.x);
+        float y_top = min(a.y, b.y) - pc.line_width;
+        float y_bot = max(a.y, b.y) + pc.line_width;
+
+        uint vo = BOX_VERTICES_PER_INVOCATION * li;
+        gl_MeshVerticesEXT[vo + 0].gl_Position = screen_to_clip(vec2(x_mid - pc.line_width, y_top));
+        gl_MeshVerticesEXT[vo + 1].gl_Position = screen_to_clip(vec2(x_mid + pc.line_width, y_top));
+        gl_MeshVerticesEXT[vo + 2].gl_Position = screen_to_clip(vec2(x_mid - pc.line_width, y_bot));
+        gl_MeshVerticesEXT[vo + 3].gl_Position = screen_to_clip(vec2(x_mid + pc.line_width, y_bot));
+
+        v_out[vo + 0].texCoord = vec2(0.0, 0.0);
+        v_out[vo + 1].texCoord = vec2(0.0, 0.0);
+        v_out[vo + 2].texCoord = vec2(0.0, 0.0);
+        v_out[vo + 3].texCoord = vec2(0.0, 0.0);
+
+        uint to = BOX_VERTICES_PER_INVOCATION  * li;
+        uint bo = BOX_TRIANGLES_PER_INVOCATION * li;
+        gl_PrimitiveTriangleIndicesEXT[bo + 0] = to + uvec3(0, 1, 2);
+        gl_PrimitiveTriangleIndicesEXT[bo + 1] = to + uvec3(1, 3, 2);
+        return;
+    }
+
+    const uint ic = min(i + 2, pc.n_samples - 1);
+    vec2 c = signal_to_screen(ic, samples[ic]);
 
     if (i > 0)                   a = 0.5 * (b - a) + a;
     if (i + 2 < pc.n_samples)    c = 0.5 * (b - c) + c;
-
-    a = a;  // already in screen space
-    b = b;
-    c = c;
 
     vec2 ab = (b - a) * inversesqrt(dot(b - a, b - a));
     vec2 cb = (b - c) * inversesqrt(dot(b - c, b - c));

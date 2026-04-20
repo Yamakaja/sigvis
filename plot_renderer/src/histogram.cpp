@@ -28,8 +28,9 @@ struct WaveformPC {
     uint32_t  n_samples;
     uint32_t  first_segment;
     uint32_t  n_segments;
+    uint32_t  viewport_width;
 };
-static_assert(sizeof(WaveformPC) == 40);
+static_assert(sizeof(WaveformPC) == 44);
 
 static VkPipelineColorBlendAttachmentState additive_blend() {
     return VkPipelineColorBlendAttachmentState{
@@ -241,6 +242,14 @@ void Histogram::flush() {
     impl_->wait_pending();
 }
 
+void Histogram::release_buffers() {
+    impl_->wait_pending();
+    impl_->staging_buffer   = {};
+    impl_->sample_buffer    = {};
+    impl_->waveform_staging = {};
+    impl_->waveform_device  = {};
+}
+
 void Histogram::clear() {
     auto& im = *impl_;
     im.wait_pending();
@@ -416,6 +425,7 @@ void Histogram::draw_waveform(std::span<const float> samples,
             .n_samples      = n_samples,
             .first_segment  = first_seg + off,
             .n_segments     = batch_segs,
+            .viewport_width = im.width,
         };
         im.record_waveform_batch(cmd, pc, groups_x);
     }
