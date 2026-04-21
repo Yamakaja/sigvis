@@ -22,6 +22,7 @@ layout(push_constant) uniform PC {
     uint  first_segment;  // absolute index of first segment in this dispatch
     uint  n_segments;     // segments to process in this dispatch
     uint  viewport_width; // render target width in pixels
+    float min_weight;     // floor for box intensity weight [0, 1]
 } pc;
 
 layout(std430, binding = 0) readonly buffer SampleBuffer {
@@ -86,10 +87,12 @@ void main() {
         gl_MeshVerticesEXT[vo + 2].gl_Position = screen_to_clip(vec2(x_mid - pc.line_width, y_bot));
         gl_MeshVerticesEXT[vo + 3].gl_Position = screen_to_clip(vec2(x_mid + pc.line_width, y_bot));
 
-        v_out[vo + 0].texCoord = vec2(0.0, 0.0);
-        v_out[vo + 1].texCoord = vec2(0.0, 0.0);
-        v_out[vo + 2].texCoord = vec2(0.0, 0.0);
-        v_out[vo + 3].texCoord = vec2(0.0, 0.0);
+        float dy     = abs(a.y - b.y);
+        float weight = max(pc.min_weight, pc.line_width / max(pc.line_width, dy));
+        v_out[vo + 0].texCoord = vec2(weight, -1.0);
+        v_out[vo + 1].texCoord = vec2(weight,  1.0);
+        v_out[vo + 2].texCoord = vec2(weight, -1.0);
+        v_out[vo + 3].texCoord = vec2(weight,  1.0);
 
         uint to = BOX_VERTICES_PER_INVOCATION  * li;
         uint bo = BOX_TRIANGLES_PER_INVOCATION * li;
@@ -127,12 +130,12 @@ void main() {
     gl_MeshVerticesEXT[vo + 6].gl_Position = screen_to_clip(c - pb);
     gl_MeshVerticesEXT[vo + 7].gl_Position = screen_to_clip(c + pb);
 
-    v_out[vo + 0].texCoord = vec2(0.0,  1.0);
-    v_out[vo + 1].texCoord = vec2(0.0, -1.0);
+    v_out[vo + 0].texCoord = vec2(1.0,  1.0);
+    v_out[vo + 1].texCoord = vec2(1.0, -1.0);
     v_out[vo + 2].texCoord = vec2(1.0,  1.0);
     v_out[vo + 3].texCoord = vec2(1.0, -1.0);
     v_out[vo + 4].texCoord = vec2(1.0,  0.0);
-    v_out[vo + 5].texCoord = vec2(0.0,  1.0);
+    v_out[vo + 5].texCoord = vec2(1.0,  1.0);
     v_out[vo + 6].texCoord = vec2(1.0, -1.0);
     v_out[vo + 7].texCoord = vec2(1.0,  1.0);
 

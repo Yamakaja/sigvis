@@ -8,5 +8,5 @@ layout(location = 0) out float outIntensity;
 
 void main() {
     float v  = fs_in.texCoord.y;
-    outIntensity = clamp(1.0 - v * v * v * v, 0.0, 1.0);
+    outIntensity = clamp(fs_in.texCoord.x * (1.0 - v * v * v * v), 0.0, 1.0);
 }

@@ -20,9 +20,10 @@ struct RenderParams {
 };
 
 struct WaveformParams {
-    std::pair<float, float> x_range   = {0.0f, 1.0f}; // normalised [0,1] range of samples to display
-    std::pair<float, float> y_range   = {-1.0f, 1.0f};
+    std::pair<float, float> x_range    = {0.0f, 1.0f}; // normalised [0,1] range of samples to display
+    std::pair<float, float> y_range    = {-1.0f, 1.0f};
     float                   line_width = 1e-3f;
+    float                   min_weight = 0.0f;          // floor for box-mode intensity weight [0, 1]
 };
 
 } // namespace plot

@@ -179,7 +179,8 @@ public:
     void draw_waveform(py::array_t<float, py::array::c_style | py::array::forcecast> arr,
                        std::pair<float,float> x_range,
                        std::pair<float,float> y_range,
-                       float line_width)
+                       float line_width,
+                       float min_weight)
     {
         auto buf = arr.request();
         if (buf.ndim != 1)
@@ -189,9 +190,10 @@ public:
         std::span<const float> samples(ptr, static_cast<size_t>(buf.shape[0]));
 
         plot::WaveformParams params{
-            .x_range   = x_range,
-            .y_range   = y_range,
+            .x_range    = x_range,
+            .y_range    = y_range,
             .line_width = line_width,
+            .min_weight = min_weight,
         };
         hist_.draw_waveform(samples, params);
     }
@@ -260,8 +262,10 @@ PYBIND11_MODULE(pyrendering, m) {
              py::arg("x_range")    = std::make_pair(0.0f, 1.0f),
              py::arg("y_range")    = std::make_pair(-1.0f, 1.0f),
              py::arg("line_width") = 1e-3f,
+             py::arg("min_weight") = 0.0f,
              "Accumulate a 1-D float32 waveform into the histogram. "
-             "x_range selects which portion of the signal to render.")
+             "x_range selects which portion of the signal to render. "
+             "min_weight floors the box-mode intensity weight [0, 1].")
         .def("download", &PyHistogram::download,
              "Download current histogram state as a (H, W) float32 numpy array.")
         .def("release_buffers", &PyHistogram::release_buffers,
