@@ -20,8 +20,9 @@ _inferno = mcm.get_cmap("inferno")
 
 def apply_colormap(
     hist: np.ndarray,
+    cm = _inferno,
     max_intensity: float | None = None,
-    log_min: float = 0.1,
+    log_min: float = 0.1
 ) -> np.ndarray:
     """Map a (H, W) float32 histogram to (H, W, 4) uint8 RGBA via inferno on a log scale.
 
@@ -33,7 +34,7 @@ def apply_colormap(
         normalized = (np.log(np.clip(hist, log_min, peak)) - np.log(log_min)) / log_range
     else:
         normalized = np.zeros_like(hist)
-    rgba = (_inferno(normalized) * 255).astype(np.uint8)
+    rgba = (cm(normalized) * 255).astype(np.uint8)
     return rgba
 
 
@@ -187,8 +188,8 @@ def _overlap_save_circular(x: np.ndarray, h: np.ndarray) -> np.ndarray:
     Y = np.fft.irfft(np.fft.rfft(blocks, axis=1) * H[None, :], n=block_size, axis=1)
     return Y[:, M:].ravel()[:N].astype(np.float32)
 
-
-def make_pam4_eye_traces(
+def make_pam_eye_traces(
+    C,
     n_symbols: int = 65536,
     sps: int = 64,
     noise_sigma: float = 0.02,
@@ -196,7 +197,7 @@ def make_pam4_eye_traces(
     h: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Generate PAM4 eye diagram traces via raised cosine filtering.
+    Generate PAM eye diagram traces via raised cosine filtering.
     Returns float32 array of shape (n_symbols//2, 2*sps, 2): [x, y].
     Each trace spans two symbol periods; x is normalised to [-1, 1].
     Pass precomputed h (from make_rcf_filter) to avoid recomputing it each call.
@@ -206,8 +207,8 @@ def make_pam4_eye_traces(
     if h is None:
         h = make_rcf_filter(sps, beta=0.8)
 
-    C = np.array([-3, -1, 1, 3], dtype=np.float64) / np.sqrt(5)
-    symbols = C[rng.integers(0, 4, n_symbols)]
+    C = (C - np.mean(C)) / np.std(C)
+    symbols = C[rng.integers(0, C.size, n_symbols)]
     if noise_sigma > 0:
         symbols += noise_sigma * rng.standard_normal(n_symbols)
 
@@ -222,6 +223,16 @@ def make_pam4_eye_traces(
         traces.shape,
     )
     return np.stack([x, traces], axis=-1).astype(np.float32)
+
+
+def make_pam4_eye_traces(
+    n_symbols: int = 65536,
+    sps: int = 64,
+    noise_sigma: float = 0.02,
+    rng: np.random.Generator | None = None,
+    h: np.ndarray | None = None,
+) -> np.ndarray:
+    return make_pam_eye_traces(np.array([-3, -1, 1, 3]), n_symbols, sps, noise_sigma, rng, h)
 
 
 def render_pam4_eye(
