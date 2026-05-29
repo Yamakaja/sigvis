@@ -4,3 +4,4 @@ build/
 .jupyter_ystore.db
 __pycache__/
 .ipynb_checkpoints
+examples/.jupyter

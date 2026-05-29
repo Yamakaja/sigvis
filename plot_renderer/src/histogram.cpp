@@ -3,9 +3,14 @@
 #include <algorithm>
 #include <cstring>
 
+#include <cmath>
+#include <numbers>
+
 #include "shaders/lines_renderer_mesh_spv.hpp"
 #include "shaders/lines_renderer_frag_spv.hpp"
 #include "shaders/waveform_renderer_mesh_spv.hpp"
+#include "shaders/points_renderer_mesh_spv.hpp"
+#include "shaders/points_renderer_frag_spv.hpp"
 
 namespace plot {
 
@@ -32,6 +37,17 @@ struct WaveformPC {
     float     min_weight;
 };
 static_assert(sizeof(WaveformPC) == 48);
+
+struct PointsPC {
+    glm::vec2 center;
+    glm::vec2 zoom;
+    glm::vec2 viewport_ratio;
+    float     point_size; // dot radius in isometric units (clamped to >= 1px)
+    float     amplitude;  // peak intensity (fragment); profile integrates to 1 when normalize
+    uint32_t  n_points;   // points in this dispatch (batch)
+    uint32_t  first_point;
+};
+static_assert(sizeof(PointsPC) == 40);
 
 static VkPipelineColorBlendAttachmentState additive_blend() {
     return VkPipelineColorBlendAttachmentState{
@@ -64,6 +80,13 @@ struct Histogram::Impl {
     vke::Buffer        waveform_device;
     vke::DescriptorSet waveform_desc_set;          // bound to waveform_device
     vke::Pipeline      waveform_pipeline;
+
+    // Points-specific resources (reuses desc_layout and image; own buffer/set so
+    // dots and traces can coexist on the same accumulation image)
+    vke::Buffer        point_staging;
+    vke::Buffer        point_device;
+    vke::DescriptorSet point_desc_set;             // bound to point_device
+    vke::Pipeline      point_pipeline;
 
     explicit Impl(vke::Context& ctx, uint32_t w, uint32_t h)
         : ctx(ctx), width(w), height(h)
@@ -135,6 +158,33 @@ struct Histogram::Impl {
             .blend_attachments        = { &blend, 1 },
             .debug_name               = "waveform_pipeline",
         });
+
+        // Points pipeline — own mesh + fragment shader (radial falloff), same layout.
+        // The push constant is shared by both stages (fragment reads `amplitude`).
+        point_desc_set = desc_layout.allocate_set("points_set");
+
+        auto point_mesh = ctx.create_shader({
+            .stage      = vke::ShaderStage::Mesh,
+            .spirv_code = spv::points_renderer_mesh,
+        });
+        auto point_frag = ctx.create_shader({
+            .stage      = vke::ShaderStage::Fragment,
+            .spirv_code = spv::points_renderer_frag,
+        });
+        vke::PushConstantRange pt_pc_range{
+            .stages = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .size   = sizeof(PointsPC),
+        };
+        point_pipeline = ctx.create_pipeline(vke::MeshPipelineCreateInfo{
+            .mesh_shader              = &point_mesh,
+            .fragment_shader          = &point_frag,
+            .descriptor_layouts       = layouts,
+            .push_constant_ranges     = { &pt_pc_range, 1 },
+            .color_attachment_formats = { &fmt, 1 },
+            .cull_mode                = VK_CULL_MODE_NONE,
+            .blend_attachments        = { &blend, 1 },
+            .debug_name               = "points_pipeline",
+        });
     }
 
     // Block until any in-flight command buffer has completed.
@@ -149,6 +199,47 @@ struct Histogram::Impl {
 
     void update_waveform_desc_set() {
         waveform_desc_set.write().bind_storage_buffer(0, waveform_device).commit();
+    }
+
+    void update_point_desc_set() {
+        point_desc_set.write().bind_storage_buffer(0, point_device).commit();
+    }
+
+    void record_points_batch(vke::CommandBuffer& cmd, const PointsPC& pc,
+                             uint32_t groups_x) {
+        cmd.image_barrier({
+            .image           = image,
+            .new_layout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .src_stage_mask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_2_SHADER_READ_BIT,
+            .dst_stage_mask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dst_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+        });
+
+        vke::CommandBuffer::ColorAttachmentInfo color[] = {{
+            .image       = &image,
+            .load_op     = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .store_op    = VK_ATTACHMENT_STORE_OP_STORE,
+            .clear_value = {.float32 = {0.f, 0.f, 0.f, 0.f}},
+        }};
+        cmd.begin_rendering({
+            .width                   = width,
+            .height                  = height,
+            .color_attachments       = color,
+            .auto_layout_transitions = false,
+        });
+        cmd.bind_pipeline(point_pipeline);
+        cmd.set_viewport(0.f, 0.f, static_cast<float>(width), static_cast<float>(height));
+        cmd.set_scissor(0, 0, width, height);
+        vke::DescriptorSet sets[] = { point_desc_set };
+        cmd.bind_descriptor_sets(point_pipeline, sets);
+        cmd.push_constants(point_pipeline,
+                           VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT, pc);
+        cmd.draw_mesh_tasks(groups_x, 1, 1);
+        cmd.end_rendering();
     }
 
     void record_waveform_batch(vke::CommandBuffer& cmd, const WaveformPC& pc,
@@ -249,6 +340,8 @@ void Histogram::release_buffers() {
     impl_->sample_buffer    = {};
     impl_->waveform_staging = {};
     impl_->waveform_device  = {};
+    impl_->point_staging    = {};
+    impl_->point_device     = {};
 }
 
 void Histogram::clear() {
@@ -430,6 +523,88 @@ void Histogram::draw_waveform(std::span<const float> samples,
             .min_weight     = params.min_weight,
         };
         im.record_waveform_batch(cmd, pc, groups_x);
+    }
+
+    cmd.end();
+    im.pending = im.ctx.submit(std::move(cmd));
+}
+
+void Histogram::draw_points(std::span<const Sample> points,
+                            const PointParams& params) {
+    auto& im = *impl_;
+
+    if (points.empty()) return;
+
+    VkDeviceSize needed = sizeof(Sample) * points.size();
+    im.wait_pending();
+
+    if (!im.point_staging || im.point_staging.size() < needed) {
+        im.point_staging = im.ctx.create_buffer({
+            .size       = needed,
+            .usage      = vke::BufferUsage::TransferSrc,
+            .domain     = vke::MemoryDomain::Host,
+            .debug_name = "points_staging",
+        });
+    }
+    if (!im.point_device || im.point_device.size() < needed) {
+        im.point_device = im.ctx.create_buffer({
+            .size       = needed,
+            .usage      = vke::BufferUsage::Storage | vke::BufferUsage::TransferDst,
+            .domain     = vke::MemoryDomain::Device,
+            .debug_name = "points_samples",
+        });
+        im.update_point_desc_set();
+    }
+
+    auto dst = im.point_staging.mapped_as<Sample>();
+    std::memcpy(dst.data(), points.data(), needed);
+
+    uint32_t n_points = static_cast<uint32_t>(points.size());
+    float    aspect   = static_cast<float>(im.height) / static_cast<float>(im.width);
+
+    // Clamp the dot radius to a 1-pixel floor so sub-pixel dots light one pixel at
+    // ~intensity 1 instead of scaling without bound. line_width/point_size in
+    // isometric units ≈ size * height/2 px.
+    float px_per_unit = static_cast<float>(im.height) * 0.5f;
+    float radius_px   = std::max(params.point_size * px_per_unit, 1.0f);
+    float point_size  = radius_px / px_per_unit;
+
+    // (1 - r^2)^2 integrates to π·R²/3 over a disc of radius R px, so amplitude =
+    // 3/(π·R²) makes each dot integrate to 1. Peak mode just uses 1.
+    float amplitude = params.normalize
+        ? 3.0f / (std::numbers::pi_v<float> * radius_px * radius_px)
+        : 1.0f;
+
+    auto cmd = im.ctx.create_command_buffer();
+    cmd.begin();
+
+    cmd.copy_buffer(im.point_staging, im.point_device, 0, 0, needed);
+    cmd.buffer_barrier({
+        .buffer          = im.point_device,
+        .src_stage_mask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .src_access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dst_stage_mask  = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+        .dst_access_mask = VK_ACCESS_2_SHADER_READ_BIT,
+    });
+
+    constexpr uint32_t WORKGROUP_SIZE       = 32;
+    constexpr uint32_t MAX_GROUPS_X         = 65535;
+    constexpr uint32_t MAX_POINTS_PER_BATCH = MAX_GROUPS_X * WORKGROUP_SIZE;
+
+    for (uint32_t off = 0; off < n_points; off += MAX_POINTS_PER_BATCH) {
+        uint32_t batch    = std::min(n_points - off, MAX_POINTS_PER_BATCH);
+        uint32_t groups_x = (batch + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+        PointsPC pc{
+            .center         = params.center,
+            .zoom           = params.zoom,
+            .viewport_ratio = { aspect, 1.0f / aspect },
+            .point_size     = point_size,
+            .amplitude      = amplitude,
+            .n_points       = batch,
+            .first_point    = off,
+        };
+        im.record_points_batch(cmd, pc, groups_x);
     }
 
     cmd.end();

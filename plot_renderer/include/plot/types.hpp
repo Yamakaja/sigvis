@@ -26,4 +26,11 @@ struct WaveformParams {
     float                   min_weight = 0.0f;          // floor for box-mode intensity weight [0, 1]
 };
 
+struct PointParams {
+    glm::vec2 center     = {0.f, 0.f};
+    glm::vec2 zoom       = {1.f, 1.f};
+    float     point_size = 1e-2f; // dot radius in isometric units (≈ point_size * height/2 px)
+    bool      normalize  = true;  // true: each dot integrates to 1; false: peak intensity 1
+};
+
 } // namespace plot

@@ -1,0 +1,79 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+const uint WORKGROUP_SIZE           = 32;
+const uint VERTICES_PER_INVOCATION  = 4; // one quad per point
+const uint TRIANGLES_PER_INVOCATION = 2;
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(triangles,
+       max_vertices   = VERTICES_PER_INVOCATION  * WORKGROUP_SIZE,
+       max_primitives = TRIANGLES_PER_INVOCATION * WORKGROUP_SIZE) out;
+
+layout(push_constant) uniform PC {
+    vec2  center;
+    vec2  zoom;
+    vec2  viewport_ratio; // (height/width, width/height)
+    float point_size;     // dot radius in isometric screen units (clamped to >= 1px on CPU)
+    float amplitude;      // peak intensity (fragment use); geometry ignores it
+    uint  n_points;       // points in this dispatch (batch)
+    uint  first_point;    // absolute index of first point in this batch
+} pc;
+
+struct Vertex {
+    vec2 position;
+};
+
+layout(std430, binding = 0) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(location = 0) out struct Varying {
+    vec2 uv; // [-1, 1]^2 across the quad; radial falloff computed in fragment
+} v_out[];
+
+// Matches lines_renderer.mesh: isometric space, both axes height/2 px per unit.
+vec2 world_to_screen(vec2 x) {
+    return pc.zoom * vec2(pc.viewport_ratio.y, -1.0) * (x - pc.center);
+}
+
+vec4 screen_to_clip(vec2 x) {
+    return vec4(x * vec2(pc.viewport_ratio.x, 1.0), 0.0, 1.0);
+}
+
+void main() {
+    const uint wg_start   = gl_WorkGroupID.x * WORKGROUP_SIZE;
+    const uint li         = gl_LocalInvocationID.x;
+    const uint local_pts  = wg_start >= pc.n_points ? 0u
+                          : min(pc.n_points - wg_start, WORKGROUP_SIZE);
+
+    if (li == 0)
+        SetMeshOutputsEXT(VERTICES_PER_INVOCATION  * local_pts,
+                          TRIANGLES_PER_INVOCATION * local_pts);
+
+    if (li >= local_pts)
+        return;
+
+    const uint i = pc.first_point + wg_start + li;
+
+    // point_size is already in isometric screen units; the quad is axis-aligned in
+    // screen space (equal px density on both axes => round dot after radial falloff).
+    vec2 c = world_to_screen(vertices[i].position);
+    float r = pc.point_size;
+
+    uint vo = VERTICES_PER_INVOCATION * li;
+    gl_MeshVerticesEXT[vo + 0].gl_Position = screen_to_clip(c + vec2(-r, -r));
+    gl_MeshVerticesEXT[vo + 1].gl_Position = screen_to_clip(c + vec2( r, -r));
+    gl_MeshVerticesEXT[vo + 2].gl_Position = screen_to_clip(c + vec2(-r,  r));
+    gl_MeshVerticesEXT[vo + 3].gl_Position = screen_to_clip(c + vec2( r,  r));
+
+    v_out[vo + 0].uv = vec2(-1.0, -1.0);
+    v_out[vo + 1].uv = vec2( 1.0, -1.0);
+    v_out[vo + 2].uv = vec2(-1.0,  1.0);
+    v_out[vo + 3].uv = vec2( 1.0,  1.0);
+
+    uint to = VERTICES_PER_INVOCATION  * li;
+    uint bo = TRIANGLES_PER_INVOCATION * li;
+    gl_PrimitiveTriangleIndicesEXT[bo + 0] = to + uvec3(0, 1, 2);
+    gl_PrimitiveTriangleIndicesEXT[bo + 1] = to + uvec3(1, 3, 2);
+}

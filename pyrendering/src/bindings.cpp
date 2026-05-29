@@ -198,6 +198,37 @@ public:
         hist_.draw_waveform(samples, params);
     }
 
+    void draw_points(py::array_t<float, py::array::c_style | py::array::forcecast> arr,
+                     std::pair<float,float> x_range,
+                     std::pair<float,float> y_range,
+                     float point_size,
+                     bool normalize)
+    {
+        auto buf = arr.request();
+        if (buf.ndim != 2 || buf.shape[1] != 2)
+            throw py::value_error("points must be shape (n_points, 2): [x, y]");
+
+        auto*  ptr      = static_cast<float*>(buf.ptr);
+        size_t n_points = static_cast<size_t>(buf.shape[0]);
+
+        std::vector<plot::Sample> pts(n_points);
+        for (size_t i = 0; i < n_points; ++i)
+            pts[i].position = { ptr[i*2+0], ptr[i*2+1] };
+
+        float cx = (x_range.first + x_range.second) * 0.5f;
+        float cy = (y_range.first + y_range.second) * 0.5f;
+        float zx = 2.0f / (x_range.second - x_range.first);
+        float zy = 2.0f / (y_range.second - y_range.first);
+
+        plot::PointParams params{
+            .center     = { cx, cy },
+            .zoom       = { zx, zy },
+            .point_size = point_size,
+            .normalize  = normalize,
+        };
+        hist_.draw_points(pts, params);
+    }
+
     void release_buffers() { hist_.release_buffers(); }
 
     py::array_t<float> download() {
@@ -266,6 +297,17 @@ PYBIND11_MODULE(pyrendering, m) {
              "Accumulate a 1-D float32 waveform into the histogram. "
              "x_range selects which portion of the signal to render. "
              "min_weight floors the box-mode intensity weight [0, 1].")
+        .def("draw_points", &PyHistogram::draw_points,
+             py::arg("points"),
+             py::arg("x_range")    = std::make_pair(-1.0f, 1.0f),
+             py::arg("y_range")    = std::make_pair(-1.0f, 1.0f),
+             py::arg("point_size") = 1e-2f,
+             py::arg("normalize")  = true,
+             "Accumulate individual datapoints as soft circular dots. "
+             "points: float32 array of shape (n_points, 2) [x, y]. "
+             "point_size is the dot radius in isometric units (≈ point_size * height/2 px). "
+             "normalize=True makes each dot integrate to 1 (density); sub-pixel dots are "
+             "clamped to a 1-pixel radius. Composites with draw()/draw_waveform().")
         .def("download", &PyHistogram::download,
              "Download current histogram state as a (H, W) float32 numpy array.")
         .def("release_buffers", &PyHistogram::release_buffers,

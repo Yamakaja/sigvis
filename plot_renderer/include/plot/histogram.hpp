@@ -33,6 +33,14 @@ public:
     // reduces the number of GPU segments accordingly.
     void draw_waveform(std::span<const float> samples, const WaveformParams& params);
 
+    // Accumulate individual datapoints rendered as soft circular dots into the
+    // histogram. Each dot uses a (1 - r^2)^2 falloff. By default a dot integrates
+    // to 1 (energy-conserving, useful for density analysis); sub-pixel dots are
+    // clamped to a 1-pixel radius so they light one pixel at ~intensity 1 rather
+    // than scaling without bound. Shares the accumulation image with draw() /
+    // draw_waveform(), so dots and traces may be composited together.
+    void draw_points(std::span<const Sample> points, const PointParams& params);
+
     // Free the sample/waveform staging and device buffers to recover GPU memory.
     // Blocks until any in-flight GPU work is complete. Safe to call between renders;
     // draw() and draw_waveform() will reallocate on next use.
