@@ -9,6 +9,7 @@ add_library(vulkan_engine STATIC
     src/command_buffer.cpp
     src/sampler.cpp
     src/submit.cpp
+    src/swapchain.cpp
     src/error.cpp
 )
 add_library(vke::vulkan_engine ALIAS vulkan_engine)

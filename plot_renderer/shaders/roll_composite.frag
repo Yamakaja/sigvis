@@ -1,13 +1,20 @@
 #version 460
 
+// Roll-mode composite. Samples a horizontally-circular strip image so the newest
+// column sits at the right edge and history scrolls left, applies the same log +
+// Turbo tonemap and black-level clipping as the phosphor composite.
+// Strip resolution matches the render target (1:1), so we texelFetch by pixel.
+
 layout(location = 0) out vec4 outColor;
 
 layout(push_constant) uniform PC {
     float max_intensity;
-    float black_level;   // raw values <= black_level map to pure black (alpha 0)
+    float black_level;   // raw values <= this map to pure black (alpha 0)
+    uint  head_col;       // (columns_written) mod strip_width
+    uint  strip_width;    // W
 } pc;
 
-layout(binding = 0) uniform sampler2D histogram_sampler;
+layout(binding = 0) uniform sampler2D strip;
 
 // Turbo colormap polynomial approximation.
 // Copyright 2019 Google LLC. SPDX-License-Identifier: Apache-2.0
@@ -28,15 +35,12 @@ vec3 turbo(float x) {
 }
 
 void main() {
-    vec2  uv    = gl_FragCoord.xy / vec2(textureSize(histogram_sampler, 0));
-    float raw   = texture(histogram_sampler, uv).r;
+    ivec2 px = ivec2(gl_FragCoord.xy);
+    int phys_x = int((pc.head_col + uint(px.x)) % pc.strip_width);
+    float raw = texelFetch(strip, ivec2(phys_x, px.y), 0).r;
 
-    // Clip low residual values to black so faded phosphor leaves no background tint.
-    // With a single trace's peak ~1.0 and exponential decay exp(-t/tau), a threshold
-    // of exp(-3) ~ 0.05 makes the trace reach black at ~3 time constants.
     bool  lit   = raw > pc.black_level;
     float luma  = lit ? log(1.0 + raw) / (log(10.0) * pc.max_intensity) : 0.0;
     float alpha = lit ? 1.0 : 0.0;
-
     outColor = vec4(turbo(luma) * alpha, alpha);
 }

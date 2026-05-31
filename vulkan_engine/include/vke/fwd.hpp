@@ -13,6 +13,7 @@ class DescriptorSetWriter;
 class Sampler;
 class CommandBuffer;
 class SubmitHandle;
+class Swapchain;
 
 enum class QueueType { Graphics, Compute, Transfer };
 enum class BufferUsage : uint32_t;

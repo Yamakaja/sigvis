@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -50,10 +51,15 @@ struct ContextCreateInfo {
 
     std::span<const uint8_t> pipeline_cache_data = {};
 
-    // When non-null: enables VK_KHR_swapchain, selects present queue.
-    // Context must be initialized in two phases (see create_instance / init_device)
-    // when a surface is needed; leave null for headless use.
-    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    // ---- Windowing (optional; leave empty for headless use) ----
+    // Extra instance extensions to enable (e.g. from glfwGetRequiredInstanceExtensions).
+    std::span<const char* const> extra_instance_extensions = {};
+
+    // When set, the Context creates its instance, then invokes this factory to obtain
+    // a VkSurfaceKHR (e.g. via glfwCreateWindowSurface). The presence of a factory
+    // enables VK_KHR_swapchain on the device and selects a present-capable queue.
+    // The Context owns the resulting surface and destroys it on teardown.
+    std::function<VkSurfaceKHR(VkInstance)> surface_factory = {};
 };
 
 class Context {
@@ -85,6 +91,18 @@ public:
     void         wait(SubmitHandle& handle);
     bool         is_complete(const SubmitHandle& handle) const noexcept;
 
+    // Synchronized submit for the present path: waits on the given semaphores at the
+    // given stages, signals the given semaphores, and signals an externally-owned
+    // fence (not recycled by the Context). The caller retains ownership of `cmd` (its
+    // VkCommandBuffer must stay alive until the fence is signalled).
+    struct FrameSubmit {
+        std::span<const VkSemaphore>            wait_semaphores  = {};
+        std::span<const VkPipelineStageFlags2>  wait_stage_masks = {};
+        std::span<const VkSemaphore>            signal_semaphores = {};
+        VkFence                                 fence = VK_NULL_HANDLE;
+    };
+    void submit(const CommandBuffer& cmd, const FrameSubmit& sync);
+
     // ---- Pipeline cache ----
 
     std::vector<uint8_t> pipeline_cache_data() const;
@@ -95,9 +113,16 @@ public:
 
     // ---- Escape hatches ----
 
-    VkDevice     native_device()    const noexcept { return device_; }
-    VkInstance   native_instance()  const noexcept { return instance_; }
-    VmaAllocator native_allocator() const noexcept { return allocator_; }
+    VkDevice         native_device()          const noexcept { return device_; }
+    VkInstance       native_instance()        const noexcept { return instance_; }
+    VkPhysicalDevice native_physical_device() const noexcept { return physical_dev_; }
+    VmaAllocator     native_allocator()       const noexcept { return allocator_; }
+    VkSurfaceKHR     native_surface()         const noexcept { return surface_; }
+
+    VkQueue  graphics_queue()  const noexcept { return graphics_.queue; }
+    uint32_t graphics_family() const noexcept { return graphics_.index; }
+    VkQueue  present_queue()   const noexcept { return present_.queue; }
+    uint32_t present_family()  const noexcept { return present_.index; }
 
 private:
     // Vulkan init helpers
@@ -137,6 +162,9 @@ private:
     QueueFamily graphics_;
     QueueFamily compute_;
     QueueFamily transfer_;
+    QueueFamily present_;   // present-capable queue (== graphics_ in practice)
+
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;  // owned when created via surface_factory
 
     PhysicalDeviceInfo device_info_;
 

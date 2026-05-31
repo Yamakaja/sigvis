@@ -55,6 +55,14 @@ Context::Context(const ContextCreateInfo& info) {
     create_instance(info);
     if (info.enable_validation_layers)
         setup_debug_messenger(info.debug_callback);
+    // Create the window surface (if any) before device creation so we can select a
+    // present-capable queue and enable VK_KHR_swapchain.
+    if (info.surface_factory) {
+        surface_ = info.surface_factory(instance_);
+        if (surface_ == VK_NULL_HANDLE)
+            throw VulkanError(VK_ERROR_SURFACE_LOST_KHR, "surface_factory",
+                              "surface factory returned VK_NULL_HANDLE");
+    }
     pick_physical_device(info);
     create_device(info);
     create_allocator();
@@ -85,6 +93,9 @@ Context::~Context() {
     if (device_ != VK_NULL_HANDLE)
         vkDestroyDevice(device_, nullptr);
 
+    if (surface_ != VK_NULL_HANDLE)
+        vkDestroySurfaceKHR(instance_, surface_, nullptr);
+
     if (messenger_ != VK_NULL_HANDLE) {
         auto fn = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
             vkGetInstanceProcAddr(instance_, "vkDestroyDebugUtilsMessengerEXT"));
@@ -100,6 +111,7 @@ Context::Context(Context&& o) noexcept
       physical_dev_(o.physical_dev_), device_(o.device_),
       allocator_(o.allocator_), pipeline_cache_(o.pipeline_cache_),
       graphics_(o.graphics_), compute_(o.compute_), transfer_(o.transfer_),
+      present_(o.present_), surface_(o.surface_),
       device_info_(std::move(o.device_info_)),
       fence_pool_(std::move(o.fence_pool_))
 {
@@ -111,6 +123,7 @@ Context::Context(Context&& o) noexcept
     o.graphics_.pool    = VK_NULL_HANDLE;
     o.compute_.pool     = VK_NULL_HANDLE;
     o.transfer_.pool    = VK_NULL_HANDLE;
+    o.surface_          = VK_NULL_HANDLE;
 }
 
 Context& Context::operator=(Context&& o) noexcept {
@@ -143,6 +156,10 @@ void Context::create_instance(const ContextCreateInfo& info) {
 
     std::vector<const char*> layers;
     std::vector<const char*> exts{ VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME };
+
+    // Windowing surface extensions (e.g. from glfwGetRequiredInstanceExtensions).
+    for (const char* e : info.extra_instance_extensions)
+        exts.push_back(e);
 
     if (info.enable_validation_layers) {
         if (check_layer("VK_LAYER_KHRONOS_validation"))
@@ -259,11 +276,35 @@ void Context::create_device(const ContextCreateInfo& info) {
     if (compute_.index  == UINT32_MAX) compute_.index  = graphics_.index;
     if (transfer_.index == UINT32_MAX) transfer_.index = graphics_.index;
 
+    // Present queue: the graphics family presents to a window surface on all targets
+    // we support (X11/Wayland desktop GPUs). Verify and fall back to a scan if not.
+    if (surface_ != VK_NULL_HANDLE) {
+        present_.index = UINT32_MAX;
+        VkBool32 graphics_can_present = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(physical_dev_, graphics_.index, surface_,
+                                             &graphics_can_present);
+        if (graphics_can_present) {
+            present_.index = graphics_.index;
+        } else {
+            for (uint32_t i = 0; i < n; ++i) {
+                VkBool32 supported = VK_FALSE;
+                vkGetPhysicalDeviceSurfaceSupportKHR(physical_dev_, i, surface_, &supported);
+                if (supported) { present_.index = i; break; }
+            }
+        }
+        if (present_.index == UINT32_MAX)
+            throw PreconditionError("no present-capable queue family found for surface");
+    }
+
     // Collect unique queue families
     std::vector<uint32_t> unique_families = { graphics_.index };
     if (compute_.index  != graphics_.index) unique_families.push_back(compute_.index);
     if (transfer_.index != graphics_.index && transfer_.index != compute_.index)
         unique_families.push_back(transfer_.index);
+    if (surface_ != VK_NULL_HANDLE &&
+        std::find(unique_families.begin(), unique_families.end(), present_.index) ==
+            unique_families.end())
+        unique_families.push_back(present_.index);
 
     float priority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
@@ -296,6 +337,8 @@ void Context::create_device(const ContextCreateInfo& info) {
     };
 
     std::vector<const char*> exts{ VK_EXT_MESH_SHADER_EXTENSION_NAME };
+    if (surface_ != VK_NULL_HANDLE)
+        exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 
     VkDeviceCreateInfo ci{
         .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -310,6 +353,8 @@ void Context::create_device(const ContextCreateInfo& info) {
     vkGetDeviceQueue(device_, graphics_.index, 0, &graphics_.queue);
     vkGetDeviceQueue(device_, compute_.index,  0, &compute_.queue);
     vkGetDeviceQueue(device_, transfer_.index, 0, &transfer_.queue);
+    if (surface_ != VK_NULL_HANDLE)
+        vkGetDeviceQueue(device_, present_.index, 0, &present_.queue);
 
     // Fill device info
     VkPhysicalDeviceProperties props;
@@ -686,11 +731,14 @@ Pipeline Context::create_pipeline(const GraphicsPipelineCreateInfo& info) {
         .pAttachments    = blend_states.data(),
     };
 
-    VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    std::vector<VkDynamicState> dynamic_states = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    if (info.dynamic_blend_constants)
+        dynamic_states.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
     VkPipelineDynamicStateCreateInfo dynamic{
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamic_states,
+        .dynamicStateCount = static_cast<uint32_t>(dynamic_states.size()),
+        .pDynamicStates    = dynamic_states.data(),
     };
 
     // Dynamic rendering — no VkRenderPass
@@ -784,11 +832,14 @@ Pipeline Context::create_pipeline(const MeshPipelineCreateInfo& info) {
         .pAttachments    = blend_states.data(),
     };
 
-    VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    std::vector<VkDynamicState> dynamic_states = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    if (info.dynamic_blend_constants)
+        dynamic_states.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
     VkPipelineDynamicStateCreateInfo dynamic{
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
-        .pDynamicStates    = dynamic_states,
+        .dynamicStateCount = static_cast<uint32_t>(dynamic_states.size()),
+        .pDynamicStates    = dynamic_states.data(),
     };
 
     VkPipelineRenderingCreateInfo rendering{
@@ -930,6 +981,44 @@ SubmitHandle Context::submit(CommandBuffer cmd) {
     VKE_CHECK(vkQueueSubmit2(graphics_.queue, 1, &si, fence));
     auto [dev, pool, buf] = cmd.detach(); // transfer ownership to SubmitHandle
     return SubmitHandle(device_, fence, pool, buf);
+}
+
+void Context::submit(const CommandBuffer& cmd, const FrameSubmit& sync) {
+    VKE_ASSERT(sync.wait_semaphores.size() == sync.wait_stage_masks.size(),
+               "FrameSubmit: wait_semaphores and wait_stage_masks size mismatch");
+
+    std::vector<VkSemaphoreSubmitInfo> wait_infos;
+    wait_infos.reserve(sync.wait_semaphores.size());
+    for (size_t i = 0; i < sync.wait_semaphores.size(); ++i)
+        wait_infos.push_back(VkSemaphoreSubmitInfo{
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = sync.wait_semaphores[i],
+            .stageMask = sync.wait_stage_masks[i],
+        });
+
+    std::vector<VkSemaphoreSubmitInfo> signal_infos;
+    signal_infos.reserve(sync.signal_semaphores.size());
+    for (VkSemaphore s : sync.signal_semaphores)
+        signal_infos.push_back(VkSemaphoreSubmitInfo{
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = s,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        });
+
+    VkCommandBufferSubmitInfo csi{
+        .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .commandBuffer = cmd.native_handle(),
+    };
+    VkSubmitInfo2 si{
+        .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount   = static_cast<uint32_t>(wait_infos.size()),
+        .pWaitSemaphoreInfos      = wait_infos.empty() ? nullptr : wait_infos.data(),
+        .commandBufferInfoCount   = 1,
+        .pCommandBufferInfos      = &csi,
+        .signalSemaphoreInfoCount = static_cast<uint32_t>(signal_infos.size()),
+        .pSignalSemaphoreInfos    = signal_infos.empty() ? nullptr : signal_infos.data(),
+    };
+    VKE_CHECK(vkQueueSubmit2(graphics_.queue, 1, &si, sync.fence));
 }
 
 void Context::wait(SubmitHandle& handle) {

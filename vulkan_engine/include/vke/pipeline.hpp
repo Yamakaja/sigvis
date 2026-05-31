@@ -50,6 +50,7 @@ struct GraphicsPipelineCreateInfo {
     VkSampleCountFlagBits rasterization_samples = VK_SAMPLE_COUNT_1_BIT;
 
     std::span<const VkPipelineColorBlendAttachmentState> blend_attachments = {};
+    bool dynamic_blend_constants = false; // adds VK_DYNAMIC_STATE_BLEND_CONSTANTS
     const char* debug_name = nullptr;
     // Viewport and scissor are always dynamic state
 };
@@ -75,6 +76,7 @@ struct MeshPipelineCreateInfo {
     VkSampleCountFlagBits rasterization_samples = VK_SAMPLE_COUNT_1_BIT;
 
     std::span<const VkPipelineColorBlendAttachmentState> blend_attachments = {};
+    bool dynamic_blend_constants = false; // adds VK_DYNAMIC_STATE_BLEND_CONSTANTS
     const char* debug_name = nullptr;
 };
 

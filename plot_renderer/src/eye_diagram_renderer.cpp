@@ -25,6 +25,7 @@ static_assert(sizeof(HistogramPC) == 40);
 
 struct CompositePC {
     float max_intensity;
+    float black_level;   // 0 = no clipping (preserves prior eye-diagram behavior)
 };
 
 // Additive blend state for histogram accumulation
@@ -338,7 +339,7 @@ const vke::Image& EyeDiagramRenderer::render(const RenderParams& params) {
 
     uint32_t n_traces, groups_y;
     HistogramPC hist_pc = im.make_histogram_pc(params, n_traces, groups_y);
-    CompositePC comp_pc{ .max_intensity = params.max_intensity };
+    CompositePC comp_pc{ .max_intensity = params.max_intensity, .black_level = 0.0f };
 
     im.submit_histogram_batches(hist_pc, n_traces, groups_y);
 

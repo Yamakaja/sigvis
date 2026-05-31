@@ -1,6 +1,8 @@
 add_library(plot_renderer STATIC
     src/eye_diagram_renderer.cpp
     src/histogram.cpp
+    src/waveform_scope.cpp
+    src/roll_scope.cpp
 )
 add_library(plot::plot_renderer ALIAS plot_renderer)
 
@@ -31,4 +33,7 @@ compile_shaders(TARGET plot_renderer SOURCES
     "${SHADER_DIR}/points_renderer.frag"
     "${SHADER_DIR}/histogram_sample.vert"
     "${SHADER_DIR}/histogram_sample.frag"
+    "${SHADER_DIR}/decay.frag"
+    "${SHADER_DIR}/roll_reduce.comp"
+    "${SHADER_DIR}/roll_composite.frag"
 )

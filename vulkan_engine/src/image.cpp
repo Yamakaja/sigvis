@@ -11,8 +11,19 @@ namespace vke {
 Image::~Image() {
     if (default_view_ != VK_NULL_HANDLE)
         vkDestroyImageView(device_, default_view_, nullptr);
-    if (image_ != VK_NULL_HANDLE)
+    // Only free images we own an allocation for. Externally-owned images
+    // (e.g. swapchain) have alloc_ == nullptr and must not be destroyed here.
+    if (image_ != VK_NULL_HANDLE && alloc_ != nullptr)
         vmaDestroyImage(allocator_, image_, alloc_);
+}
+
+Image Image::from_external(VkDevice device, VkImage image, VkImageView view,
+                           uint32_t w, uint32_t h, VkFormat format,
+                           ImageUsage usage, VkImageLayout initial_layout) {
+    // allocator_ / alloc_ stay null: the VkImage is owned elsewhere.
+    return Image(/*allocator*/ nullptr, device, image, /*alloc*/ nullptr, view,
+                 w, h, /*depth*/ 1, format, usage, initial_layout,
+                 /*transfer_queue*/ VK_NULL_HANDLE, /*transfer_pool*/ VK_NULL_HANDLE);
 }
 
 Image::Image(Image&& o) noexcept
@@ -33,7 +44,7 @@ Image& Image::operator=(Image&& o) noexcept {
     if (this != &o) {
         if (default_view_ != VK_NULL_HANDLE)
             vkDestroyImageView(device_, default_view_, nullptr);
-        if (image_ != VK_NULL_HANDLE)
+        if (image_ != VK_NULL_HANDLE && alloc_ != nullptr)
             vmaDestroyImage(allocator_, image_, alloc_);
         allocator_      = o.allocator_;
         device_         = o.device_;

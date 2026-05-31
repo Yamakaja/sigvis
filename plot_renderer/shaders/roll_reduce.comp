@@ -1,0 +1,97 @@
+#version 460
+
+// Roll-mode reduction. Each workgroup reduces one stripe (one pixel column) of K
+// raw samples from a circular sample ring into a vertical amplitude histogram, and
+// writes the finished column into a horizontally-circular strip image.
+//
+// We reduce *segments* (consecutive sample pairs), not isolated samples — mirroring
+// the box mode in waveform_renderer.mesh. Each segment connecting amplitudes a and b
+// deposits ink into every amplitude bin it spans, [min(a,b), max(a,b)], extended by
+// half the line width at each end with a soft 1 - v^4 edge. The per-segment weight
+// follows box mode's 1/dy density grading: weight = line_width / max(line_width, dy),
+// so a steep segment spreads a constant amount of ink thinly across many bins while a
+// flat one concentrates it. Accumulating K-1 such segments builds the column's
+// envelope+density, and additive log+Turbo composite gives the box-mode look.
+//
+// Bins are accumulated in shared memory as fixed-point integers (no float atomics
+// needed); one workgroup writes its column once, matching the write-once-then-
+// integer-shift scroll model.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Ring {
+    float samples[];
+};
+layout(r32f, binding = 1) writeonly uniform image2D strip;
+
+layout(push_constant) uniform PC {
+    uint  ring_capacity;       // C, sample ring length
+    uint  strip_width;         // W, strip image width (columns)
+    uint  height;              // H, amplitude bins == strip image height
+    uint  samples_per_stripe;  // K
+    uint  ring_start_phys;     // (first sample of first stripe) mod C
+    uint  col_start_phys;      // (first output column) mod W
+    float y_min;
+    float y_max;
+    float line_width_px;       // vertical line width, in rows/pixels
+    float weight_scale;        // fixed-point scale for shared-memory accumulation
+} pc;
+
+const uint MAX_BINS = 2304;    // covers up to 4K height; LDS = 2304*4 = ~9 KB
+shared uint s_bins[MAX_BINS];
+
+void main() {
+    const uint H   = min(pc.height, MAX_BINS);
+    const uint col = gl_WorkGroupID.x;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint wg  = gl_WorkGroupSize.x;
+
+    for (uint i = lid; i < H; i += wg)
+        s_bins[i] = 0u;
+    barrier();
+
+    const uint  K        = pc.samples_per_stripe;
+    const float half_lw  = max(pc.line_width_px * 0.5, 0.5);
+    const float lw       = pc.line_width_px;
+    const float inv_span = 1.0 / (pc.y_max - pc.y_min);
+    const uint  base     = pc.ring_start_phys + col * K;
+
+    // amplitude -> fractional row (y_max at top).
+    #define ROW_OF(s) ((1.0 - ((s) - pc.y_min) * inv_span) * float(H))
+
+    // One segment per consecutive sample pair (K-1 segments per column).
+    for (uint j = lid; j + 1u < K; j += wg) {
+        float ra = ROW_OF(samples[(base + j)      % pc.ring_capacity]);
+        float rb = ROW_OF(samples[(base + j + 1u) % pc.ring_capacity]);
+
+        float core_lo = min(ra, rb);
+        float core_hi = max(ra, rb);
+        float dy      = core_hi - core_lo;
+        float weight  = lw / max(lw, dy);          // box-mode density grading
+
+        int r0 = int(floor(core_lo - half_lw));
+        int r1 = int(ceil (core_hi + half_lw));
+        for (int r = r0; r <= r1; ++r) {
+            if (r < 0 || r >= int(H)) continue;
+            float rowc = float(r) + 0.5;
+            float cover;
+            if (rowc >= core_lo && rowc <= core_hi) {
+                cover = 1.0;                        // inside the segment's span
+            } else {                               // soft line-width extension
+                float d = (rowc < core_lo) ? (core_lo - rowc) : (rowc - core_hi);
+                float v = d / half_lw;             // 0..1 across the edge
+                cover = 1.0 - v * v * v * v;
+            }
+            if (cover <= 0.0) continue;
+            atomicAdd(s_bins[r], uint(weight * cover * pc.weight_scale));
+        }
+    }
+    #undef ROW_OF
+    barrier();
+
+    const uint phys_col = (pc.col_start_phys + col) % pc.strip_width;
+    for (uint r = lid; r < H; r += wg) {
+        float val = float(s_bins[r]) / pc.weight_scale;
+        imageStore(strip, ivec2(int(phys_col), int(r)), vec4(val, 0.0, 0.0, 0.0));
+    }
+}

@@ -75,6 +75,12 @@ public:
                                               VkDeviceSize offset = 0,
                                               VkDeviceSize range  = VK_WHOLE_SIZE);
 
+    // Dynamic storage buffer: the bound region's base is the supplied offset plus a
+    // per-bind dynamic offset (see CommandBuffer::bind_descriptor_sets overload).
+    DescriptorSetWriter& bind_storage_buffer_dynamic(uint32_t binding, const Buffer& buf,
+                                                     VkDeviceSize offset = 0,
+                                                     VkDeviceSize range  = VK_WHOLE_SIZE);
+
     DescriptorSetWriter& bind_combined_image_sampler(
         uint32_t binding, const Image& image, const Sampler& sampler,
         VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

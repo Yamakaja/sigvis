@@ -70,9 +70,18 @@ public:
     VkImage     native_handle()       const noexcept { return image_; }
     VkImageView native_default_view() const noexcept { return default_view_; }
 
+    // Wrap an externally-owned image (e.g. a swapchain image). The returned Image
+    // owns and destroys the supplied view, but does NOT free the VkImage itself
+    // (it has no VMA allocation). Used by Swapchain.
+    static Image from_external(VkDevice device, VkImage image, VkImageView view,
+                               uint32_t w, uint32_t h, VkFormat format,
+                               ImageUsage usage,
+                               VkImageLayout initial_layout = VK_IMAGE_LAYOUT_UNDEFINED);
+
 private:
     friend class Context;
     friend class CommandBuffer;
+    friend class Swapchain;
 
     Image(VmaAllocator allocator, VkDevice device,
           VkImage image, VmaAllocation alloc, VkImageView default_view,

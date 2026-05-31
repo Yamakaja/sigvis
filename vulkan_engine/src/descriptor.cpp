@@ -90,6 +90,21 @@ DescriptorSetWriter& DescriptorSetWriter::bind_storage_buffer(
     return *this;
 }
 
+DescriptorSetWriter& DescriptorSetWriter::bind_storage_buffer_dynamic(
+    uint32_t binding, const Buffer& buf, VkDeviceSize offset, VkDeviceSize range)
+{
+    buffer_infos_.push_back({ buf.native_handle(), offset, range });
+    writes_.push_back(VkWriteDescriptorSet{
+        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet          = set_.native_handle(),
+        .dstBinding      = binding,
+        .descriptorCount = 1,
+        .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+        .pBufferInfo     = &buffer_infos_.back(),
+    });
+    return *this;
+}
+
 DescriptorSetWriter& DescriptorSetWriter::bind_combined_image_sampler(
     uint32_t binding, const Image& image, const Sampler& sampler, VkImageLayout layout)
 {

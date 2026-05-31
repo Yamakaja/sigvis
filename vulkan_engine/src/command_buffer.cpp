@@ -283,6 +283,11 @@ void CommandBuffer::set_scissor(int32_t x, int32_t y, uint32_t w, uint32_t h) {
     vkCmdSetScissor(cmd_, 0, 1, &s);
 }
 
+void CommandBuffer::set_blend_constants(float r, float g, float b, float a) {
+    const float c[4] = { r, g, b, a };
+    vkCmdSetBlendConstants(cmd_, c);
+}
+
 void CommandBuffer::bind_descriptor_sets(const Pipeline& pipeline,
                                           std::span<const DescriptorSet> sets,
                                           uint32_t first_set) {

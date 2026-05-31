@@ -91,6 +91,8 @@ public:
     void set_viewport(float x, float y, float w, float h,
                       float min_depth = 0.0f, float max_depth = 1.0f);
     void set_scissor(int32_t x, int32_t y, uint32_t w, uint32_t h);
+    // Requires the bound pipeline to declare VK_DYNAMIC_STATE_BLEND_CONSTANTS.
+    void set_blend_constants(float r, float g, float b, float a);
 
     void bind_descriptor_sets(const Pipeline& pipeline,
                                std::span<const DescriptorSet> sets,
