@@ -12,6 +12,12 @@ struct RollParams {
     float y_max =  1.5f;
     float window_seconds = 2.0f;  // visible time span (snapped to an integer samples/stripe)
     float line_width_px  = 1.5f;  // vertical line width in pixels (splats across amplitude bins)
+    float min_weight     = 0.2f;  // coverage floor [0,1]: keeps steep connectors visible
+                                  // so a continuous waveform never breaks into floating segments
+    float density        = 1.0f;  // 0 = box-mode phosphor (1/dy, energy-conserving);
+                                  // 1 = additive count (overlaps add -> compact = brighter)
+    uint32_t interp      = 1u;    // GPU Lagrange upsample factor per raw segment (1 = off,
+                                  // 8 = reconstruct inter-sample curve for sharper histograms)
     float max_intensity  = 1.0f;  // composite log scale
     float black_level    = 0.05f; // raw bin values <= this map to black
 };
@@ -42,6 +48,14 @@ public:
     // Caller must ensure no in-flight work references the old strip (vkDeviceWaitIdle).
     void resize(uint32_t width, uint32_t height);
 
+    // Change the time axis (Hz). Discards history so samples at the old rate don't
+    // mix with the new ones. Use when switching sample sources.
+    void set_sample_rate(float sample_rate_hz);
+    float sample_rate() const noexcept;
+
+    // Drop all accumulated history (clears the strip on the next render()).
+    void reset();
+
     // Queue samples for upload into the ring on the next render().
     void push_chunk(std::span<const float> samples);
     size_t pending() const;
@@ -53,6 +67,15 @@ public:
     // Effective samples-per-stripe (K) for the current window — exposed for the UI
     // so it can show the exact (quantized) window length.
     uint32_t samples_per_stripe() const noexcept;
+
+    // Seconds of real samples currently buffered in the ring (grows after start /
+    // source switch until it saturates at the ring capacity). For the UI to show
+    // actual history vs the configured window.
+    float buffered_seconds() const noexcept;
+    // Maximum lookback the ring can hold at the current sample rate (seconds).
+    float capacity_seconds() const noexcept;
+    // Seconds actually on screen right now: min(buffered, exact window).
+    float shown_seconds() const noexcept;
 
     uint32_t width()  const noexcept;
     uint32_t height() const noexcept;

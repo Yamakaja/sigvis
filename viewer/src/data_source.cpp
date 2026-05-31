@@ -31,13 +31,6 @@ void DataSource::set_signal(const Signal& s) {
     am_rate_.store(s.am_rate,     std::memory_order_relaxed);
 }
 
-size_t DataSource::drain(std::vector<std::vector<float>>& out) {
-    out.clear();
-    std::lock_guard<std::mutex> lock(mtx_);
-    out.swap(queue_);
-    return out.size();
-}
-
 void DataSource::run() {
     using clock = std::chrono::steady_clock;
 
@@ -67,16 +60,7 @@ void DataSource::run() {
         for (uint32_t i = 0; i < chunk_size_; ++i)
             chunk[i] = amp * std::sin(static_cast<float>(w * i) + phase) + noise_std * gauss(rng);
 
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            if (queue_.size() >= MAX_QUEUED) {
-                size_t drop = queue_.size() - MAX_QUEUED + 1;
-                queue_.erase(queue_.begin(), queue_.begin() + drop);
-                dropped_.fetch_add(drop, std::memory_order_relaxed);
-            }
-            queue_.push_back(std::move(chunk));
-        }
-        produced_.fetch_add(1, std::memory_order_relaxed);
+        queue_.push(std::move(chunk));
 
         next += std::chrono::duration_cast<clock::duration>(period);
         std::this_thread::sleep_until(next);

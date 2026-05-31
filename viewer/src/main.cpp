@@ -15,6 +15,7 @@
 #include <plot/roll_scope.hpp>
 
 #include "data_source.hpp"
+#include "audio_source.hpp"
 #include "view_state.hpp"
 
 #include <imgui.h>
@@ -29,6 +30,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace {
@@ -175,10 +178,37 @@ int main(int argc, char** argv) {
         };
         ImGui_ImplVulkan_Init(&imgui_init);
 
-        // ---- Data source (synthetic 1 MS/s in 1k-sample records at 1 kHz) ----
+        // ---- Sample sources ----
+        // Synthetic: 1 MS/s in 1k-sample records at 1 kHz. Audio: 48 kHz mono capture
+        // (created lazily on first selection). Exactly one is active at a time.
         const uint32_t CHUNK = 1000;
-        DataSource data(CHUNK, 1000);
-        data.start();
+        DataSource synth(CHUNK, 1000);
+        std::unique_ptr<AudioSource> audio;        // lazily started
+        std::string audio_device;                  // empty = server default
+        ISource* active = &synth;
+        synth.start();
+        roll.set_sample_rate(active->sample_rate());
+
+        enum class SourceKind { Synthetic, Audio };
+        SourceKind source_kind = SourceKind::Synthetic;
+
+        auto switch_source = [&](SourceKind kind) {
+            ISource* next = active;
+            if (kind == SourceKind::Synthetic) {
+                next = &synth;
+            } else {
+                if (!audio) audio = std::make_unique<AudioSource>(48000, 256, audio_device);
+                if (!audio->ok() && audio->produced() == 0) audio->start();
+                next = audio.get();
+            }
+            if (next != active) {
+                active = next;
+                roll.set_sample_rate(active->sample_rate());
+                roll.reset();
+                scope.reset_persistence();
+            }
+            source_kind = kind;
+        };
 
         auto recreate = [&] {
             int w = 0, h = 0;
@@ -207,6 +237,9 @@ int main(int argc, char** argv) {
         // Roll-mode controls.
         float roll_window_s     = 2.0f;
         float roll_line_width   = 1.5f;  // vertical line width in pixels
+        float roll_min_weight   = 0.2f;  // coverage floor (connectivity)
+        float roll_density      = 1.0f;  // phosphor (0) .. additive density (1)
+        int   roll_interp       = 1;     // Lagrange upsample factor (1=off, up to 8)
         float roll_max_intensity = 1.0f;
         float roll_black_level  = 0.05f;
 
@@ -262,9 +295,9 @@ int main(int argc, char** argv) {
             g_input.scroll_accum = 0.0;
 
             // --- Ingest new records (route to the active mode) ---
-            data.set_signal(sig);
+            synth.set_signal(sig);
             if (!paused) {
-                data.drain(drained);
+                active->drain(drained);
                 for (auto& c : drained) {
                     if (mode == Mode::Trigger) scope.push_chunk(c);
                     else                       roll.push_chunk(c);
@@ -305,29 +338,54 @@ int main(int argc, char** argv) {
                     ImGui::SeparatorText("display (roll)");
                     ImGui::SliderFloat("window (s)", &roll_window_s, 0.2f, 10.0f, "%.2f");
                     uint32_t K = roll.samples_per_stripe();
-                    if (K > 0)
-                        ImGui::Text("%u samp/col -> %.3f s exact", K,
-                                    static_cast<double>(K) * roll.width() / SAMPLE_RATE);
+                    if (K > 0 && roll.sample_rate() > 0.0f) {
+                        float exact = static_cast<float>(K) * roll.width() / roll.sample_rate();
+                        ImGui::Text("%u samp/col -> %.3f s window", K, exact);
+                        ImGui::Text("history: %.3f s shown / %.3f s buffered",
+                                    roll.shown_seconds(), roll.buffered_seconds());
+                        ImGui::Text("ring capacity: %.2f s", roll.capacity_seconds());
+                    }
                     ImGui::SliderFloat("v line width (px)", &roll_line_width, 0.5f, 8.0f, "%.1f");
+                    ImGui::SliderFloat("coverage floor", &roll_min_weight, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("density", &roll_density, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderInt("interp (Lagrange)", &roll_interp, 1, 8);
                     ImGui::SliderFloat("max intensity##roll", &roll_max_intensity, 0.1f, 8.0f, "%.2f");
                     ImGui::SliderFloat("black level##roll", &roll_black_level, 0.0f, 0.5f, "%.3f");
                 }
                 ImGui::Checkbox("pause", &paused);
 
-                ImGui::SeparatorText("signal");
-                ImGui::SliderFloat("frequency (cyc/rec)", &sig.cycles, 0.5f, 60.0f, "%.2f");
-                ImGui::SliderFloat("amplitude", &sig.amplitude, 0.0f, 2.0f, "%.2f");
-                ImGui::SliderFloat("noise std", &sig.noise_std, 0.0f, 0.5f, "%.3f");
-                ImGui::SliderFloat("phase jitter", &sig.jitter, 0.0f, 3.1416f, "%.2f");
-                ImGui::SliderFloat("AM depth", &sig.am_depth, 0.0f, 1.0f, "%.2f");
-                ImGui::SliderFloat("AM rate", &sig.am_rate, 0.0f, 0.5f, "%.3f");
+                ImGui::SeparatorText("source");
+                int src_i = static_cast<int>(source_kind);
+                if (ImGui::RadioButton("synthetic", &src_i, 0)) switch_source(SourceKind::Synthetic);
+                ImGui::SameLine();
+                if (ImGui::RadioButton("audio", &src_i, 1)) switch_source(SourceKind::Audio);
+                ImGui::Text("rate: %.0f Hz", active->sample_rate());
+
+                if (source_kind == SourceKind::Synthetic) {
+                    ImGui::SeparatorText("signal");
+                    ImGui::SliderFloat("frequency (cyc/rec)", &sig.cycles, 0.5f, 60.0f, "%.2f");
+                    ImGui::SliderFloat("amplitude", &sig.amplitude, 0.0f, 2.0f, "%.2f");
+                    ImGui::SliderFloat("noise std", &sig.noise_std, 0.0f, 0.5f, "%.3f");
+                    ImGui::SliderFloat("phase jitter", &sig.jitter, 0.0f, 3.1416f, "%.2f");
+                    ImGui::SliderFloat("AM depth", &sig.am_depth, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("AM rate", &sig.am_rate, 0.0f, 0.5f, "%.3f");
+                } else {
+                    ImGui::SeparatorText("audio");
+                    if (audio && audio->ok()) {
+                        ImGui::TextUnformatted("capturing (default source)");
+                        ImGui::TextDisabled("for playback, capture a sink .monitor via PULSE_SOURCE");
+                    } else if (audio) {
+                        ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "audio error:");
+                        ImGui::TextWrapped("%s", audio->error().c_str());
+                    }
+                }
 
                 ImGui::SeparatorText("status");
                 ImGui::Text("last record  min %.3f  max %.3f", stats.min, stats.max);
                 ImGui::Text("             pp  %.3f  rms %.3f", stats.pp, stats.rms);
                 ImGui::Text("produced %llu  dropped %llu",
-                            (unsigned long long)data.produced(),
-                            (unsigned long long)data.dropped());
+                            (unsigned long long)active->produced(),
+                            (unsigned long long)active->dropped());
                 ImGui::Text("pending this frame: %zu",
                             mode == Mode::Trigger ? scope.pending() : roll.pending());
                 ImGui::End();
@@ -365,6 +423,9 @@ int main(int argc, char** argv) {
                     .y_min = view.y_min, .y_max = view.y_max,
                     .window_seconds = roll_window_s,
                     .line_width_px = roll_line_width,
+                    .min_weight = roll_min_weight,
+                    .density = roll_density,
+                    .interp = static_cast<uint32_t>(roll_interp),
                     .max_intensity = roll_max_intensity,
                     .black_level = roll_black_level,
                 };
@@ -409,7 +470,8 @@ int main(int argc, char** argv) {
             if (max_frames > 0 && ++presented >= max_frames) break;
         }
 
-        data.stop();
+        synth.stop();
+        if (audio) audio->stop();
         vkDeviceWaitIdle(device);
 
         ImGui_ImplVulkan_Shutdown();

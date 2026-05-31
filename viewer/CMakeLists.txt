@@ -18,7 +18,12 @@ set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(viewer
     src/main.cpp
     src/data_source.cpp
+    src/audio_source.cpp
 )
+
+# PulseAudio simple API for live audio capture (works against PipeWire's pulse server).
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PULSE_SIMPLE REQUIRED IMPORTED_TARGET libpulse-simple)
 
 target_link_libraries(viewer PRIVATE
     plot::plot_renderer
@@ -27,6 +32,7 @@ target_link_libraries(viewer PRIVATE
     glfw
     glm::glm
     fmt::fmt
+    PkgConfig::PULSE_SIMPLE
 )
 
 target_compile_options(viewer PRIVATE

@@ -1,9 +1,15 @@
 #version 460
 
-// Roll-mode composite. Samples a horizontally-circular strip image so the newest
+// Roll-mode composite. Reads a horizontally-circular strip image so the newest
 // column sits at the right edge and history scrolls left, applies the same log +
 // Turbo tonemap and black-level clipping as the phosphor composite.
-// Strip resolution matches the render target (1:1), so we texelFetch by pixel.
+//
+// The strip is read as a STORAGE image (imageLoad), not sampled, so it can stay in
+// VK_IMAGE_LAYOUT_GENERAL permanently. That avoids per-frame whole-image layout
+// transitions (GENERAL<->SHADER_READ_ONLY) which, across frames in flight, would
+// retile the entire image while it is being read — visible as global luminance
+// flicker even though only a few columns change per frame.
+// Strip resolution matches the render target (1:1), so we index by pixel.
 
 layout(location = 0) out vec4 outColor;
 
@@ -14,7 +20,7 @@ layout(push_constant) uniform PC {
     uint  strip_width;    // W
 } pc;
 
-layout(binding = 0) uniform sampler2D strip;
+layout(r32f, binding = 0) readonly uniform image2D strip;
 
 // Turbo colormap polynomial approximation.
 // Copyright 2019 Google LLC. SPDX-License-Identifier: Apache-2.0
@@ -37,7 +43,7 @@ vec3 turbo(float x) {
 void main() {
     ivec2 px = ivec2(gl_FragCoord.xy);
     int phys_x = int((pc.head_col + uint(px.x)) % pc.strip_width);
-    float raw = texelFetch(strip, ivec2(phys_x, px.y), 0).r;
+    float raw = imageLoad(strip, ivec2(phys_x, px.y)).r;
 
     bool  lit   = raw > pc.black_level;
     float luma  = lit ? log(1.0 + raw) / (log(10.0) * pc.max_intensity) : 0.0;

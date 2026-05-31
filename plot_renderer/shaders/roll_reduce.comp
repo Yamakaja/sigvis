@@ -13,6 +13,14 @@
 // flat one concentrates it. Accumulating K-1 such segments builds the column's
 // envelope+density, and additive log+Turbo composite gives the box-mode look.
 //
+// Optional Lagrange upsampling: each raw segment [s_j, s_{j+1}] is subdivided into
+// `interp` sub-segments whose endpoints follow a 4-point cubic Lagrange curve through
+// (s_{j-1}, s_j, s_{j+1}, s_{j+2}). This reconstructs the bandlimited waveform between
+// samples, so the histogram captures true inter-sample peaks/curvature instead of
+// straight-line chords. A 1/interp normalization keeps overall brightness constant as
+// the factor changes (energy-exact for the phosphor term; steep edges in the additive
+// term get relatively dimmer, which is acceptable).
+//
 // Bins are accumulated in shared memory as fixed-point integers (no float atomics
 // needed); one workgroup writes its column once, matching the write-once-then-
 // integer-shift scroll model.
@@ -35,10 +43,24 @@ layout(push_constant) uniform PC {
     float y_max;
     float line_width_px;       // vertical line width, in rows/pixels
     float weight_scale;        // fixed-point scale for shared-memory accumulation
+    float min_weight;          // coverage floor [0,1]: every covered bin gets >= this,
+                               // so steep connectors stay visible (no floating segments)
+    float density;             // 0 = box-mode phosphor (energy-conserving, 1/dy);
+                               // 1 = additive count (overlaps add -> compact = brighter)
+    uint  interp;              // Lagrange upsample factor per raw segment (1 = off)
 } pc;
 
 const uint MAX_BINS = 2304;    // covers up to 4K height; LDS = 2304*4 = ~9 KB
 shared uint s_bins[MAX_BINS];
+
+// 4-point cubic Lagrange through (p0,p1,p2,p3) at nodes (-1,0,1,2), eval at t in [0,1].
+float lagrange4(float p0, float p1, float p2, float p3, float t) {
+    float tm1 = t - 1.0, tm2 = t - 2.0, tp1 = t + 1.0;
+    return p0 * (-(t)   * tm1 * tm2 / 6.0)
+         + p1 * ( tp1   * tm1 * tm2 / 2.0)
+         + p2 * (-tp1   * t   * tm2 / 2.0)
+         + p3 * ( tp1   * t   * tm1 / 6.0);
+}
 
 void main() {
     const uint H   = min(pc.height, MAX_BINS);
@@ -55,37 +77,58 @@ void main() {
     const float lw       = pc.line_width_px;
     const float inv_span = 1.0 / (pc.y_max - pc.y_min);
     const uint  base     = pc.ring_start_phys + col * K;
+    const uint  interp   = max(pc.interp, 1u);
+    const float wnorm    = 1.0 / float(interp);   // keep brightness constant vs interp
 
     // amplitude -> fractional row (y_max at top).
     #define ROW_OF(s) ((1.0 - ((s) - pc.y_min) * inv_span) * float(H))
+    #define SAMP(off)  samples[(base + j + uint(off) + pc.ring_capacity) % pc.ring_capacity]
 
-    // One segment per consecutive sample pair (K-1 segments per column).
-    for (uint j = lid; j + 1u < K; j += wg) {
-        float ra = ROW_OF(samples[(base + j)      % pc.ring_capacity]);
-        float rb = ROW_OF(samples[(base + j + 1u) % pc.ring_capacity]);
+    // Fill every amplitude bin spanned by a (sub)segment [ra, rb], with box-mode
+    // density grading, the soft line-width edge, and a 1/interp brightness norm.
+    #define FILL_SEGMENT(ra, rb)                                                  \
+    {                                                                             \
+        float _lo = min((ra), (rb));                                             \
+        float _hi = max((ra), (rb));                                             \
+        float _dy = _hi - _lo;                                                   \
+        float _phos = lw / max(lw, _dy);                                         \
+        float _w = max(pc.min_weight, mix(_phos, 1.0, pc.density)) * wnorm;      \
+        int _r0 = int(floor(_lo - half_lw));                                     \
+        int _r1 = int(ceil (_hi + half_lw));                                     \
+        for (int r = _r0; r <= _r1; ++r) {                                       \
+            if (r < 0 || r >= int(H)) continue;                                  \
+            float rowc = float(r) + 0.5;                                         \
+            float cover;                                                         \
+            if (rowc >= _lo && rowc <= _hi) {                                    \
+                cover = 1.0;                                                     \
+            } else {                                                            \
+                float d = (rowc < _lo) ? (_lo - rowc) : (rowc - _hi);           \
+                float v = d / half_lw;                                          \
+                cover = 1.0 - v * v * v * v;                                    \
+            }                                                                   \
+            if (cover <= 0.0) continue;                                          \
+            atomicAdd(s_bins[r], uint(_w * cover * pc.weight_scale));            \
+        }                                                                       \
+    }
 
-        float core_lo = min(ra, rb);
-        float core_hi = max(ra, rb);
-        float dy      = core_hi - core_lo;
-        float weight  = lw / max(lw, dy);          // box-mode density grading
-
-        int r0 = int(floor(core_lo - half_lw));
-        int r1 = int(ceil (core_hi + half_lw));
-        for (int r = r0; r <= r1; ++r) {
-            if (r < 0 || r >= int(H)) continue;
-            float rowc = float(r) + 0.5;
-            float cover;
-            if (rowc >= core_lo && rowc <= core_hi) {
-                cover = 1.0;                        // inside the segment's span
-            } else {                               // soft line-width extension
-                float d = (rowc < core_lo) ? (core_lo - rowc) : (rowc - core_hi);
-                float v = d / half_lw;             // 0..1 across the edge
-                cover = 1.0 - v * v * v * v;
+    // One raw segment per consecutive sample pair; optionally Lagrange-upsampled.
+    for (uint j = lid; j < K; j += wg) {
+        if (interp == 1u) {
+            FILL_SEGMENT(ROW_OF(SAMP(0)), ROW_OF(SAMP(1)));
+        } else {
+            // 4-point cubic through the segment's neighbourhood, subdivided `interp`x.
+            float p0 = SAMP(-1), p1 = SAMP(0), p2 = SAMP(1), p3 = SAMP(2);
+            float prev = ROW_OF(p1);
+            for (uint k = 1u; k <= interp; ++k) {
+                float t    = float(k) / float(interp);
+                float cur  = ROW_OF(lagrange4(p0, p1, p2, p3, t));
+                FILL_SEGMENT(prev, cur);
+                prev = cur;
             }
-            if (cover <= 0.0) continue;
-            atomicAdd(s_bins[r], uint(weight * cover * pc.weight_scale));
         }
     }
+    #undef FILL_SEGMENT
+    #undef SAMP
     #undef ROW_OF
     barrier();
 

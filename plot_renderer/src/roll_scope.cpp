@@ -12,7 +12,7 @@
 
 namespace plot {
 
-// Matches roll_reduce.comp (6 * u32 + 4 * f32 == 40 bytes).
+// Matches roll_reduce.comp (7 * u32 + 6 * f32 == 52 bytes).
 struct RollReducePC {
     uint32_t ring_capacity;
     uint32_t strip_width;
@@ -24,8 +24,11 @@ struct RollReducePC {
     float    y_max;
     float    line_width_px;
     float    weight_scale;
+    float    min_weight;
+    float    density;
+    uint32_t interp;
 };
-static_assert(sizeof(RollReducePC) == 40);
+static_assert(sizeof(RollReducePC) == 52);
 
 // Matches roll_composite.frag.
 struct RollCompositePC {
@@ -64,7 +67,6 @@ struct RollScope::Impl {
     vke::Pipeline         reduce_pipeline;
 
     // Composite.
-    vke::Sampler          sampler;
     vke::DescriptorLayout composite_layout;
     vke::DescriptorSet    composite_set;
     vke::Pipeline         composite_pipeline;
@@ -135,13 +137,10 @@ struct RollScope::Impl {
             .push_constant_ranges = { &rpc, 1 }, .debug_name = "roll_reduce_pipeline" });
 
         // ---- Composite ----
-        sampler = ctx.create_sampler({
-            .mag_filter = VK_FILTER_NEAREST, .min_filter = VK_FILTER_NEAREST,
-            .address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE });
-
+        // Strip is read as a storage image so it can stay in GENERAL permanently
+        // (no per-frame layout transitions; see roll_composite.frag).
         vke::DescriptorBinding cb{ .binding = 0,
-            .type = vke::DescriptorType::CombinedImageSampler,
+            .type = vke::DescriptorType::StorageImage,
             .stages = VK_SHADER_STAGE_FRAGMENT_BIT };
         composite_layout = ctx.create_descriptor_layout({ .bindings = { &cb, 1 },
             .debug_name = "roll_composite_layout" });
@@ -169,12 +168,13 @@ struct RollScope::Impl {
             .bind_storage_image(1, strip, VK_IMAGE_LAYOUT_GENERAL)
             .commit();
         composite_set.write()
-            .bind_combined_image_sampler(0, strip, sampler,
-                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .bind_storage_image(0, strip, VK_IMAGE_LAYOUT_GENERAL)
             .commit();
     }
 
-    // One-shot clear so the strip starts black (leaves COLOR_ATTACHMENT_OPTIMAL).
+    // One-shot clear so the strip starts black. Leaves the strip in GENERAL — the
+    // layout it stays in for the entire steady-state lifetime (write via compute,
+    // read via imageLoad), so no whole-image transitions ever happen per frame.
     void clear_strip_immediate() {
         auto cmd = ctx.create_command_buffer();
         cmd.begin();
@@ -185,12 +185,20 @@ struct RollScope::Impl {
         cmd.begin_rendering({ .width = width, .height = height,
             .color_attachments = c, .auto_layout_transitions = true });
         cmd.end_rendering();
+        cmd.image_barrier({
+            .image = strip, .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dst_access_mask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT });
         cmd.end();
         ctx.submit_and_wait(std::move(cmd));
     }
 
-    // Record a clear of the strip into `cmd` (for replay). Leaves it in
-    // COLOR_ATTACHMENT_OPTIMAL.
+    // Record a clear of the strip into `cmd` (for replay — rare: K change, resize,
+    // reset). Transitions to a color attachment to clear, then back to GENERAL.
+    // Replay frames are full refreshes, so the one-off whole-image transition here
+    // is invisible (unlike a per-frame transition).
     void clear_strip(vke::CommandBuffer& cmd) {
         cmd.image_barrier({
             .image = strip, .new_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -205,6 +213,14 @@ struct RollScope::Impl {
         cmd.begin_rendering({ .width = width, .height = height,
             .color_attachments = c, .auto_layout_transitions = false });
         cmd.end_rendering();
+        cmd.image_barrier({
+            .image = strip, .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_stage_mask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dst_access_mask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT });
     }
 };
 
@@ -221,7 +237,46 @@ RollScope& RollScope::operator=(RollScope&&) noexcept = default;
 uint32_t RollScope::width()  const noexcept { return impl_->width; }
 uint32_t RollScope::height() const noexcept { return impl_->height; }
 uint32_t RollScope::samples_per_stripe() const noexcept { return impl_->cur_K; }
+float    RollScope::sample_rate() const noexcept { return impl_->sample_rate; }
 size_t   RollScope::pending() const { return impl_->pending_.size(); }
+
+float RollScope::buffered_seconds() const noexcept {
+    auto& im = *impl_;
+    if (im.sample_rate <= 0.0f) return 0.0f;
+    uint64_t buffered = std::min<uint64_t>(im.total_samples_, im.ring_capacity);
+    return static_cast<float>(buffered) / im.sample_rate;
+}
+
+float RollScope::capacity_seconds() const noexcept {
+    auto& im = *impl_;
+    if (im.sample_rate <= 0.0f) return 0.0f;
+    return static_cast<float>(im.ring_capacity) / im.sample_rate;
+}
+
+float RollScope::shown_seconds() const noexcept {
+    auto& im = *impl_;
+    if (im.sample_rate <= 0.0f || im.cur_K == 0) return 0.0f;
+    // Columns of real data on screen: min(stripes available, strip width).
+    uint64_t avail_stripes = im.total_samples_ / im.cur_K;
+    uint64_t shown_cols = std::min<uint64_t>(avail_stripes, im.width);
+    return static_cast<float>(shown_cols * im.cur_K) / im.sample_rate;
+}
+
+void RollScope::reset() {
+    auto& im = *impl_;
+    im.total_samples_    = 0;
+    im.samples_consumed_ = 0;
+    im.stripes_emitted_  = 0;
+    im.pending_.clear();
+    im.needs_replay      = true;
+}
+
+void RollScope::set_sample_rate(float sample_rate_hz) {
+    auto& im = *impl_;
+    if (sample_rate_hz == im.sample_rate || sample_rate_hz <= 0.0f) return;
+    im.sample_rate = sample_rate_hz;
+    reset();
+}
 
 void RollScope::resize(uint32_t width, uint32_t height) {
     auto& im = *impl_;
@@ -297,8 +352,10 @@ void RollScope::render(vke::CommandBuffer& cmd, vke::Image& target,
     }
 
     // ---- How many whole new stripes are available, bounded by ring + strip width ----
+    // Reserve one sample as the bridge: each column's last segment connects to the
+    // first sample of the next column, so we need (n_new*K + 1) written samples.
     uint64_t avail   = im.total_samples_ - im.samples_consumed_;
-    uint64_t n_new64 = avail / K;
+    uint64_t n_new64 = (avail >= 1) ? (avail - 1) / K : 0;
     uint64_t max_safe = im.ring_capacity / K;          // stripes that fit in the ring
     if (n_new64 > max_safe) {                            // fell behind: drop oldest unread
         uint64_t skip = n_new64 - max_safe;
@@ -312,12 +369,13 @@ void RollScope::render(vke::CommandBuffer& cmd, vke::Image& target,
 
     // ---- Compute reduction: write new columns into the circular strip ----
     if (n_new > 0) {
+        // GENERAL -> GENERAL: order this frame's column writes after the previous
+        // frame's composite reads (submission-order across frames in flight). No
+        // layout change, so untouched columns are never disturbed.
         cmd.image_barrier({
             .image = im.strip, .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-            .src_stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                               VK_ACCESS_2_SHADER_READ_BIT,
+            .src_stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access_mask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
             .dst_stage_mask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             .dst_access_mask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT });
 
@@ -327,7 +385,9 @@ void RollScope::render(vke::CommandBuffer& cmd, vke::Image& target,
             .ring_start_phys = static_cast<uint32_t>(im.samples_consumed_ % im.ring_capacity),
             .col_start_phys  = static_cast<uint32_t>(im.stripes_emitted_ % W),
             .y_min = params.y_min, .y_max = params.y_max,
-            .line_width_px = params.line_width_px, .weight_scale = WEIGHT_SCALE };
+            .line_width_px = params.line_width_px, .weight_scale = WEIGHT_SCALE,
+            .min_weight = params.min_weight, .density = params.density,
+            .interp = std::max(1u, params.interp) };
 
         cmd.bind_pipeline(im.reduce_pipeline);
         vke::DescriptorSet sets[] = { im.reduce_set };
