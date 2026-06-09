@@ -19,6 +19,7 @@ add_executable(viewer
     src/main.cpp
     src/data_source.cpp
     src/audio_source.cpp
+    src/plstream_source.cpp
 )
 
 # PulseAudio simple API for live audio capture (works against PipeWire's pulse server).

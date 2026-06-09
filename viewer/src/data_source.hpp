@@ -22,7 +22,7 @@ public:
 
     void   start() override;
     void   stop()  override;
-    size_t drain(std::vector<std::vector<float>>& out) override { return queue_.drain(out); }
+    size_t drain(std::vector<Frame>& out) override { return queue_.drain(out); }
     float    sample_rate() const override { return static_cast<float>(chunk_size_) * chunks_per_sec_; }
     uint64_t produced()    const override { return queue_.produced(); }
     uint64_t dropped()     const override { return queue_.dropped(); }

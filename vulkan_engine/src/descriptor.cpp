@@ -146,9 +146,19 @@ DescriptorSetWriter& DescriptorSetWriter::bind_storage_image(
 void DescriptorSetWriter::commit() {
     if (committed_) return;
     committed_ = true;
-    if (!writes_.empty())
-        vkUpdateDescriptorSets(set_.device_, static_cast<uint32_t>(writes_.size()),
-                                writes_.data(), 0, nullptr);
+    if (writes_.empty()) return;
+
+    // The bind_* helpers stored &buffer_infos_.back() / &image_infos_.back() into each
+    // write, but later push_back()s may have reallocated those vectors, dangling the
+    // earlier pointers. The vectors are stable now, so re-point each write from them in
+    // bind order (a write is a buffer write iff it set pBufferInfo, else an image write).
+    size_t bi = 0, ii = 0;
+    for (auto& w : writes_) {
+        if (w.pBufferInfo)      w.pBufferInfo = &buffer_infos_[bi++];
+        else if (w.pImageInfo)  w.pImageInfo  = &image_infos_[ii++];
+    }
+    vkUpdateDescriptorSets(set_.device_, static_cast<uint32_t>(writes_.size()),
+                            writes_.data(), 0, nullptr);
 }
 
 } // namespace vke

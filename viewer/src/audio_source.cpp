@@ -52,14 +52,20 @@ void AudioSource::run() {
     ok_.store(true, std::memory_order_relaxed);
 
     const size_t bytes = static_cast<size_t>(chunk_size_) * sizeof(float);
+    int64_t seq = 0;
     while (running_.load(std::memory_order_relaxed)) {
-        std::vector<float> chunk(chunk_size_);
-        if (pa_simple_read(s, chunk.data(), bytes, &err) < 0) {
+        Frame frame;
+        frame.samples.resize(chunk_size_);
+        if (pa_simple_read(s, frame.samples.data(), bytes, &err) < 0) {
             error_ = pa_strerror(err);
             ok_.store(false, std::memory_order_relaxed);
             break;
         }
-        queue_.push(std::move(chunk));
+        frame.seq               = seq;
+        frame.timestamp         = seq * static_cast<int64_t>(chunk_size_); // 1 tick/sample
+        frame.samples_per_frame = chunk_size_;
+        queue_.push(std::move(frame));
+        ++seq;
     }
 
     pa_simple_free(s);

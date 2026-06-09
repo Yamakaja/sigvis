@@ -3,6 +3,8 @@ add_library(plot_renderer STATIC
     src/histogram.cpp
     src/waveform_scope.cpp
     src/roll_scope.cpp
+    src/sample_ring.cpp
+    src/stream_scope.cpp
 )
 add_library(plot::plot_renderer ALIAS plot_renderer)
 
@@ -36,4 +38,6 @@ compile_shaders(TARGET plot_renderer SOURCES
     "${SHADER_DIR}/decay.frag"
     "${SHADER_DIR}/roll_reduce.comp"
     "${SHADER_DIR}/roll_composite.frag"
+    "${SHADER_DIR}/stream_reduce.comp"
+    "${SHADER_DIR}/stream_trigger.mesh"
 )
